@@ -4,6 +4,8 @@ const Anthropic = require('@anthropic-ai/sdk');
 const mammoth = require('mammoth');
 const rateLimit = require('express-rate-limit');
 const { Pool } = require('pg');
+const Razorpay = require('razorpay');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
@@ -16,6 +18,12 @@ const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
+});
+
+// Razorpay instance
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
 // Create tables on startup
@@ -42,6 +50,18 @@ const initDB = async () => {
         created_at TIMESTAMP DEFAULT NOW()
       );
     `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS subscriptions (
+        id SERIAL PRIMARY KEY,
+        google_id VARCHAR(255) NOT NULL,
+        razorpay_subscription_id VARCHAR(255),
+        razorpay_payment_id VARCHAR(255),
+        status VARCHAR(50) DEFAULT 'pending',
+        amount INTEGER DEFAULT 29900,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
     console.log('Database tables ready');
   } catch (error) {
     console.error('DB init error:', error);
@@ -49,7 +69,7 @@ const initDB = async () => {
 };
 initDB();
 
-// Rate limiting — 10 requests per minute per IP
+// Rate limiting
 const limiter = rateLimit({
   windowMs: 60 * 1000,
   max: 10,
@@ -116,6 +136,61 @@ app.post('/user/:google_id/increment', async (req, res) => {
   } catch (error) {
     console.error('Increment error:', error);
     res.status(500).json({ error: 'Failed to increment count' });
+  }
+});
+
+// Create Razorpay order for Pro subscription
+app.post('/payment/create-order', async (req, res) => {
+  const { google_id } = req.body;
+  if (!google_id) return res.status(400).json({ error: 'google_id required' });
+  try {
+    const order = await razorpay.orders.create({
+      amount: 29900, // Rs.299 in paise
+      currency: 'INR',
+      receipt: `amalite_${google_id}_${Date.now()}`,
+      notes: { google_id },
+    });
+    res.json({ order_id: order.id, amount: order.amount, currency: order.currency });
+  } catch (error) {
+    console.error('Create order error:', error);
+    res.status(500).json({ error: 'Failed to create payment order' });
+  }
+});
+
+// Verify Razorpay payment and unlock Pro
+app.post('/payment/verify', async (req, res) => {
+  const { google_id, razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+  if (!google_id || !razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+    return res.status(400).json({ error: 'Missing payment details' });
+  }
+  try {
+    // Verify signature
+    const body = razorpay_order_id + '|' + razorpay_payment_id;
+    const expectedSignature = crypto
+      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+      .update(body.toString())
+      .digest('hex');
+
+    if (expectedSignature !== razorpay_signature) {
+      return res.status(400).json({ error: 'Invalid payment signature' });
+    }
+
+    // Unlock Pro in database
+    await pool.query(`
+      UPDATE users SET is_pro = TRUE, updated_at = NOW()
+      WHERE google_id = $1;
+    `, [google_id]);
+
+    // Save subscription record
+    await pool.query(`
+      INSERT INTO subscriptions (google_id, razorpay_payment_id, status)
+      VALUES ($1, $2, 'active');
+    `, [google_id, razorpay_payment_id]);
+
+    res.json({ success: true, message: 'Pro unlocked successfully' });
+  } catch (error) {
+    console.error('Verify payment error:', error);
+    res.status(500).json({ error: 'Failed to verify payment' });
   }
 });
 
