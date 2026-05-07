@@ -49,7 +49,7 @@ const initDB = async () => {
 };
 initDB();
 
-// Rate limiting
+// Rate limiting — 10 requests per minute per IP
 const limiter = rateLimit({
   windowMs: 60 * 1000,
   max: 10,
@@ -98,7 +98,6 @@ app.post('/user/:google_id/increment', async (req, res) => {
   const { google_id } = req.params;
   const { job_snippet, verdict } = req.body;
   try {
-    // Increment count
     const result = await pool.query(`
       UPDATE users
       SET proposal_count = proposal_count + 1, updated_at = NOW()
@@ -108,7 +107,6 @@ app.post('/user/:google_id/increment', async (req, res) => {
 
     if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
 
-    // Save proposal record
     await pool.query(`
       INSERT INTO proposals (google_id, job_snippet, verdict)
       VALUES ($1, $2, $3);
