@@ -26,7 +26,7 @@ app.use('/generate-proposal', limiter);
 app.get('/health', (req, res) => {
   res.json({
     status: 'Amalite backend is running',
-    version: '2.1',
+    version: '2.2',
     hasApiKey: !!process.env.ANTHROPIC_API_KEY,
   });
 });
@@ -147,6 +147,6 @@ app.post('/payment/verify', (req, res) => {
 // ─── START ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`✅ Amalite backend v2.1 running on port ${PORT}`);
+  console.log(`✅ Amalite backend v2.2 running on port ${PORT}`);
   console.log(`   API key set: ${!!process.env.ANTHROPIC_API_KEY}`);
 });
