@@ -76,7 +76,67 @@ app.post('/generate-proposal', async function(req, res) {
   }
 });
 
+
+
 // ─── RAZORPAY: CREATE ORDER ───────────────────────────────────────────────────
+
+// ADD THIS BEFORE the /payment/create-order endpoint in server.js
+
+app.get('/payment/checkout', function(req, res) {
+  var keyId = req.query.key_id || '';
+  var orderId = req.query.order_id || '';
+  var amount = req.query.amount || '';
+  var currency = req.query.currency || 'INR';
+
+  var html = '<!DOCTYPE html>' +
+    '<html>' +
+    '<head>' +
+    '<meta name="viewport" content="width=device-width, initial-scale=1">' +
+    '<script src="https://checkout.razorpay.com/v1/checkout.js"></script>' +
+    '<style>' +
+    'body { margin:0; padding:20px; background:#0A0A18; font-family:-apple-system,sans-serif; color:white; text-align:center; }' +
+    '.msg { margin-top: 40px; font-size: 16px; color: #2DD4BF; }' +
+    '</style>' +
+    '</head>' +
+    '<body>' +
+    '<div class="msg" id="status">Opening secure payment...</div>' +
+    '<script>' +
+    'var options = {' +
+    'key: "' + keyId + '",' +
+    'amount: "' + amount + '",' +
+    'currency: "' + currency + '",' +
+    'name: "Amalite",' +
+    'description: "Pro Monthly Plan",' +
+    'order_id: "' + orderId + '",' +
+    'theme: { color: "#2DD4BF" },' +
+    'handler: function(response) {' +
+    'document.getElementById("status").innerText = "Verifying...";' +
+    'window.ReactNativeWebView.postMessage(JSON.stringify({' +
+    'type: "PAYMENT_SUCCESS",' +
+    'payment_id: response.razorpay_payment_id,' +
+    'order_id: response.razorpay_order_id,' +
+    'signature: response.razorpay_signature' +
+    '}));' +
+    '},' +
+    'modal: { ondismiss: function() {' +
+    'window.ReactNativeWebView.postMessage(JSON.stringify({ type: "PAYMENT_DISMISSED" }));' +
+    '}}' +
+    '};' +
+    'window.onload = function() {' +
+    'var rzp = new Razorpay(options);' +
+    'rzp.on("payment.failed", function(r) {' +
+    'window.ReactNativeWebView.postMessage(JSON.stringify({ type: "PAYMENT_FAILED", error: r.error.description }));' +
+    '});' +
+    'rzp.open();' +
+    '};' +
+    '</script>' +
+    '</body>' +
+    '</html>';
+
+  res.setHeader('Content-Type', 'text/html');
+  res.send(html);
+});
+
 app.post('/payment/create-order', async function(req, res) {
   try {
     var order = await razorpay.orders.create({
