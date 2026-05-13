@@ -32,22 +32,43 @@ app.use('/generate-proposal', limiter);
 app.get('/health', function(req, res) {
   res.json({
     status: 'Amalite backend is running',
-    version: '6.0 (Gemini Edition)',
+    version: '6.1 (Gemini Restored)',
     hasGeminiKey: !!process.env.GEMINI_API_KEY,
     hasRazorpay: !!process.env.RAZORPAY_KEY_ID,
   });
 });
 
-// ─── GENERATE PROPOSAL ────────────────────────────────────────────────────────
+app.get('/test', function(req, res) {
+  res.json({ ok: true, timestamp: new Date().toISOString() });
+});
+
+// ─── GENERATE (Main App Endpoint) ─────────────────────────────────────────────
+app.post('/generate', async function(req, res) {
+  var system = req.body.system || '';
+  var message = req.body.message;
+  if (!message) return res.status(400).json({ error: 'message required' });
+  
+  try {
+    // Combine system instructions and user message for Gemini
+    const fullPrompt = system + '\n\n' + message;
+    const result = await model.generateContent(fullPrompt);
+    
+    // Send back exactly what the frontend expects
+    res.json({ content: result.response.text() });
+  } catch (error) {
+    console.error('/generate error:', error.message);
+    res.status(500).json({ error: 'AI generation failed', detail: error.message });
+  }
+});
+
+// ─── GENERATE PROPOSAL (Backup Endpoint) ──────────────────────────────────────
 app.post('/generate-proposal', async function(req, res) {
   var prompt = req.body.prompt;
   if (!prompt) return res.status(400).json({ error: 'prompt required' });
   try {
     const result = await model.generateContent(prompt);
-    const responseText = result.response.text();
-    res.json({ proposal: responseText });
+    res.json({ proposal: result.response.text() });
   } catch (error) {
-    console.error("Gemini Error:", error);
     res.status(500).json({ error: 'Generation failed', detail: error.message });
   }
 });
@@ -56,10 +77,13 @@ app.post('/generate-proposal', async function(req, res) {
 app.post('/payment/create-order', async function(req, res) {
   try {
     var order = await razorpay.orders.create({
-      amount: 29900, // Rs 299 in paise (updated from 49900)
+      amount: 29900,
       currency: 'INR',
       receipt: 'amalite_pro_' + Date.now(),
-      notes: { google_id: req.body.google_id || 'guest', plan: 'pro_monthly' },
+      notes: {
+        google_id: req.body.google_id || 'guest',
+        plan: 'pro_monthly',
+      },
     });
     res.json({
       order_id: order.id,
@@ -78,7 +102,8 @@ app.post('/payment/verify', function(req, res) {
   var order_id = req.body.order_id;
   var payment_id = req.body.payment_id;
   var signature = req.body.signature;
-  
+  var google_id = req.body.google_id;
+
   try {
     var body = order_id + '|' + payment_id;
     var expectedSignature = crypto
@@ -87,16 +112,36 @@ app.post('/payment/verify', function(req, res) {
       .digest('hex');
 
     if (expectedSignature === signature) {
+      console.log('Payment verified for:', google_id, 'payment:', payment_id);
       res.json({ success: true, is_pro: true, payment_id: payment_id });
     } else {
       res.status(400).json({ success: false, error: 'Invalid payment signature' });
     }
   } catch (error) {
+    console.error('/payment/verify error:', error.message);
     res.status(500).json({ success: false, error: 'Verification failed' });
   }
 });
 
+// ─── USER ENDPOINTS (Restored!) ───────────────────────────────────────────────
+app.post('/user/sync', function(req, res) {
+  var google_id = req.body.google_id;
+  var name = req.body.name;
+  var email = req.body.email;
+  if (!google_id) return res.status(400).json({ error: 'google_id required' });
+  res.json({ google_id: google_id, name: name || '', email: email || '', proposal_count: 0, is_pro: false });
+});
+
+app.get('/user/:google_id', function(req, res) {
+  res.json({ google_id: req.params.google_id, proposal_count: 0, is_pro: false });
+});
+
+app.post('/user/:google_id/increment', function(req, res) {
+  res.json({ success: true });
+});
+
+// ─── START ────────────────────────────────────────────────────────────────────
 var PORT = process.env.PORT || 3000;
 app.listen(PORT, function() {
-  console.log('Amalite backend v6.0 running on port ' + PORT);
+  console.log('Amalite backend v6.1 running on port ' + PORT);
 });
