@@ -29,7 +29,7 @@ app.use('/generate-proposal', limiter);
 app.get('/health', function(req, res) {
   res.json({
     status: 'Amalite backend is running',
-    version: '5.0',
+    version: '5.1',
     hasApiKey: !!process.env.ANTHROPIC_API_KEY,
     hasRazorpay: !!process.env.RAZORPAY_KEY_ID,
   });
@@ -45,7 +45,6 @@ app.post('/generate', async function(req, res) {
   var message = req.body.message;
   if (!message) return res.status(400).json({ error: 'message required' });
   if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not set' });
-
   try {
     var result = await client.messages.create({
       model: 'claude-haiku-4-5-20251001',
@@ -75,28 +74,85 @@ app.post('/generate-proposal', async function(req, res) {
     res.status(500).json({ error: 'Generation failed', detail: error.message });
   }
 });
+
+// ─── RAZORPAY: HOSTED CHECKOUT PAGE ──────────────────────────────────────────
 app.get('/payment/checkout', function(req, res) {
   var keyId = req.query.key_id || '';
   var orderId = req.query.order_id || '';
   var amount = req.query.amount || '';
   var currency = req.query.currency || 'INR';
-  var html = '<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><script src="https://checkout.razorpay.com/v1/checkout.js"></script><style>body{margin:0;padding:20px;background:#0A0A18;color:white;text-align:center;font-family:-apple-system,sans-serif;}.msg{margin-top:40px;font-size:16px;color:#2DD4BF;}</style></head><body><div class="msg" id="status">Opening secure payment...</div><script>var options={key:"' + keyId + '",amount:"' + amount + '",currency:"' + currency + '",name:"Amalite",description:"Pro Monthly Plan",order_id:"' + orderId + '",theme:{color:"#2DD4BF"},handler:function(r){document.getElementById("status").innerText="Verifying...";window.ReactNativeWebView.postMessage(JSON.stringify({type:"PAYMENT_SUCCESS",payment_id:r.razorpay_payment_id,order_id:r.razorpay_order_id,signature:r.razorpay_signature}));},modal:{ondismiss:function(){window.ReactNativeWebView.postMessage(JSON.stringify({type:"PAYMENT_DISMISSED"}));}}};window.onload=function(){var rzp=new Razorpay(options);rzp.on("payment.failed",function(r){window.ReactNativeWebView.postMessage(JSON.stringify({type:"PAYMENT_FAILED",error:r.error.description}));});rzp.open();};</script></body></html>';
+
+  var html = '<!DOCTYPE html>' +
+    '<html>' +
+    '<head>' +
+    '<meta name="viewport" content="width=device-width, initial-scale=1">' +
+    '<script src="https://checkout.razorpay.com/v1/checkout.js"></script>' +
+    '<style>' +
+    'body { background-color: #0A0A18; color: #2DD4BF; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; font-family: sans-serif; text-align: center; }' +
+    '#status { font-size: 16px; padding: 20px; }' +
+    '</style>' +
+    '</head>' +
+    '<body>' +
+    '<div id="status">Loading Secure Payment Gateway...</div>' +
+    '<script>' +
+    'var options = {' +
+    'key: "' + keyId + '",' +
+    'amount: "' + amount + '",' +
+    'currency: "' + currency + '",' +
+    'name: "Amalite",' +
+    'description: "Pro Monthly Plan — Unlimited Proposals",' +
+    'order_id: "' + orderId + '",' +
+    'theme: { color: "#2DD4BF" },' +
+    'handler: function(response) {' +
+    'document.getElementById("status").innerText = "Verifying payment...";' +
+    'window.ReactNativeWebView.postMessage(JSON.stringify({' +
+    'type: "PAYMENT_SUCCESS",' +
+    'payment_id: response.razorpay_payment_id,' +
+    'order_id: response.razorpay_order_id,' +
+    'signature: response.razorpay_signature' +
+    '}));' +
+    '},' +
+    'modal: {' +
+    'ondismiss: function() {' +
+    'window.ReactNativeWebView.postMessage(JSON.stringify({ type: "PAYMENT_DISMISSED" }));' +
+    '}' +
+    '}' +
+    '};' +
+    'setTimeout(function() {' +
+    'try {' +
+    'var rzp = new Razorpay(options);' +
+    'rzp.on("payment.failed", function(response) {' +
+    'window.ReactNativeWebView.postMessage(JSON.stringify({' +
+    'type: "PAYMENT_FAILED",' +
+    'error: response.error.description' +
+    '}));' +
+    '});' +
+    'rzp.open();' +
+    'document.getElementById("status").innerText = "Awaiting Payment...";' +
+    '} catch(e) {' +
+    'document.getElementById("status").innerText = "Error: " + e.message;' +
+    '}' +
+    '}, 500);' +
+    '</script>' +
+    '</body>' +
+    '</html>';
+
   res.setHeader('Content-Type', 'text/html');
   res.send(html);
 });
+
 // ─── RAZORPAY: CREATE ORDER ───────────────────────────────────────────────────
 app.post('/payment/create-order', async function(req, res) {
   try {
     var order = await razorpay.orders.create({
-      amount: 399,        // $3.99 in smallest unit (paise for INR, cents for USD)
-      currency: 'INR',   // Razorpay test mode uses INR
+      amount: 49900,
+      currency: 'INR',
       receipt: 'amalite_pro_' + Date.now(),
       notes: {
         google_id: req.body.google_id || 'guest',
         plan: 'pro_monthly',
       },
     });
-
     res.json({
       order_id: order.id,
       amount: order.amount,
@@ -117,7 +173,6 @@ app.post('/payment/verify', function(req, res) {
   var google_id = req.body.google_id;
 
   try {
-    // Verify signature
     var body = order_id + '|' + payment_id;
     var expectedSignature = crypto
       .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
@@ -125,7 +180,6 @@ app.post('/payment/verify', function(req, res) {
       .digest('hex');
 
     if (expectedSignature === signature) {
-      // Payment verified - mark user as Pro
       console.log('Payment verified for:', google_id, 'payment:', payment_id);
       res.json({ success: true, is_pro: true, payment_id: payment_id });
     } else {
@@ -157,6 +211,6 @@ app.post('/user/:google_id/increment', function(req, res) {
 // ─── START ────────────────────────────────────────────────────────────────────
 var PORT = process.env.PORT || 3000;
 app.listen(PORT, function() {
-  console.log('Amalite backend v5.0 running on port ' + PORT);
+  console.log('Amalite backend v5.1 running on port ' + PORT);
   console.log('Razorpay ready:', !!process.env.RAZORPAY_KEY_ID);
 });
