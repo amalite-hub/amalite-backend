@@ -49,11 +49,8 @@ app.post('/generate', async function(req, res) {
   if (!message) return res.status(400).json({ error: 'message required' });
   
   try {
-    // Combine system instructions and user message for Gemini
     const fullPrompt = system + '\n\n' + message;
     const result = await model.generateContent(fullPrompt);
-    
-    // Send back exactly what the frontend expects
     res.json({ content: result.response.text() });
   } catch (error) {
     console.error('/generate error:', error.message);
@@ -123,7 +120,7 @@ app.post('/payment/verify', function(req, res) {
   }
 });
 
-// ─── USER ENDPOINTS (Restored!) ───────────────────────────────────────────────
+// ─── USER ENDPOINTS ───────────────────────────────────────────────
 app.post('/user/sync', function(req, res) {
   var google_id = req.body.google_id;
   var name = req.body.name;
