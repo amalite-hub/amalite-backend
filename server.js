@@ -58,8 +58,8 @@ app.post('/generate', async function(req, res) {
 app.post('/payment/create-order', async function(req, res) {
   try {
     var order = await razorpay.orders.create({
-      amount: 29900,
-      currency: 'INR',
+      amount: 499,
+      currency: 'USD',
       receipt: 'amalite_pro_' + Date.now(),
       notes: { google_id: req.body.google_id || 'guest', plan: 'pro_monthly' },
     });
