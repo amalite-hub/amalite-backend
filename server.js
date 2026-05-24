@@ -9,6 +9,7 @@ const { Resend } = require('resend');
 require('dotenv').config();
 
 const app = express();
+app.set('trust proxy', 1);
 app.use(cors({ origin: '*', methods: ['GET', 'POST'], allowedHeaders: ['Content-Type'] }));
 app.use(express.json({ limit: '20mb' }));
 
@@ -38,20 +39,24 @@ pool.query(`
     used BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT NOW()
   )
-`).catch(function(err) { console.error('OTP table create error:', err.message); });
+`).then(function() {
+  console.log('OTP table ready');
+}).catch(function(err) { console.error('OTP table create error:', err.message); });
 
-// Create users table if not exists
+// Create users table if not exists — uses google_id to match existing schema
 pool.query(`
   CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
-    user_id TEXT UNIQUE NOT NULL,
+    google_id TEXT UNIQUE NOT NULL,
     name TEXT,
     email TEXT UNIQUE,
     is_pro BOOLEAN DEFAULT FALSE,
     proposal_count INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT NOW()
   )
-`).catch(function(err) { console.error('Users table create error:', err.message); });
+`).then(function() {
+  console.log('Users table ready');
+}).catch(function(err) { console.error('Users table create error:', err.message); });
 
 const limiter = rateLimit({
   windowMs: 60 * 1000,
@@ -60,10 +65,10 @@ const limiter = rateLimit({
 });
 app.use('/generate', limiter);
 
-// OTP rate limiter - max 3 sends per 10 minutes per IP
+// OTP rate limiter - max 5 sends per 10 minutes per IP
 const otpLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
-  max: 3,
+  max: 5,
   message: { error: 'Too many OTP requests. Please wait 10 minutes.' },
 });
 
@@ -71,7 +76,7 @@ const otpLimiter = rateLimit({
 app.get('/health', function(req, res) {
   res.json({
     status: 'Amalite backend is running',
-    version: '8.0 (OTP Auth + Gemini)',
+    version: '8.1 (OTP Auth + Gemini)',
     model: 'gemini-2.5-flash',
     hasGeminiKey: !!process.env.GEMINI_API_KEY,
     hasRazorpay: !!process.env.RAZORPAY_KEY_ID,
@@ -109,7 +114,7 @@ app.post('/auth/send-otp', otpLimiter, async function(req, res) {
   var expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
   try {
-    // Delete any existing unused OTPs for this email
+    // Delete any existing OTPs for this email
     await pool.query('DELETE FROM otp_codes WHERE email = $1', [email]);
 
     // Store new OTP
@@ -118,9 +123,12 @@ app.post('/auth/send-otp', otpLimiter, async function(req, res) {
       [email, code, expiresAt]
     );
 
+    console.log('OTP stored for', email, '- code:', code);
+
     // Send email via Resend
+    var fromAddress = 'Amalite <' + (process.env.FROM_EMAIL || 'noreply@amalite.org') + '>';
     await resend.emails.send({
-      from: `Amalite <${process.env.FROM_EMAIL || 'noreply@amalite.org'}>`,
+      from: fromAddress,
       to: email,
       subject: 'Your Amalite verification code',
       html: `
@@ -154,6 +162,8 @@ app.post('/auth/verify-otp', async function(req, res) {
     return res.status(400).json({ error: 'Email and code required' });
   }
 
+  console.log('Verifying OTP for', email, 'code:', code);
+
   try {
     // Find valid OTP
     var result = await pool.query(
@@ -161,28 +171,36 @@ app.post('/auth/verify-otp', async function(req, res) {
       [email, code]
     );
 
+    console.log('OTP rows found:', result.rows.length);
+
     if (result.rows.length === 0) {
+      // Debug: check if code exists at all
+      var debugResult = await pool.query(
+        'SELECT code, used, expires_at FROM otp_codes WHERE email = $1 ORDER BY created_at DESC LIMIT 1',
+        [email]
+      );
+      console.log('Latest OTP for email:', JSON.stringify(debugResult.rows));
       return res.status(400).json({ error: 'Invalid or expired code. Please request a new one.' });
     }
 
     // Mark OTP as used
     await pool.query('UPDATE otp_codes SET used = TRUE WHERE id = $1', [result.rows[0].id]);
 
-    // Create or find user
+    // Create or find user using google_id column
     var userId = email.replace(/[^a-z0-9]/g, '_') + '_amalite';
     await pool.query(
-      `INSERT INTO users (user_id, name, email) VALUES ($1, $2, $3)
+      `INSERT INTO users (google_id, name, email) VALUES ($1, $2, $3)
        ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name`,
       [userId, name, email]
     );
 
-    // Get user pro status
+    // Get user
     var userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     var user = userResult.rows[0];
 
     res.json({
       success: true,
-      user_id: user.user_id,
+      user_id: user.google_id,
       name: user.name,
       email: user.email,
       is_pro: user.is_pro,
@@ -228,9 +246,8 @@ app.post('/payment/verify', async function(req, res) {
       .digest('hex');
 
     if (expectedSignature === signature) {
-      // Mark user as pro in DB
       if (user_id) {
-        await pool.query('UPDATE users SET is_pro = TRUE WHERE user_id = $1', [user_id]);
+        await pool.query('UPDATE users SET is_pro = TRUE WHERE google_id = $1', [user_id]);
       }
       res.json({ success: true, is_pro: true, payment_id: payment_id });
     } else {
@@ -243,5 +260,5 @@ app.post('/payment/verify', async function(req, res) {
 
 var PORT = process.env.PORT || 3000;
 app.listen(PORT, function() {
-  console.log('Amalite backend v8.0 running on port ' + PORT);
+  console.log('Amalite backend v8.1 running on port ' + PORT);
 });
