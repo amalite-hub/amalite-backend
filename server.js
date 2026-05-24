@@ -120,7 +120,7 @@ app.post('/auth/send-otp', otpLimiter, async function(req, res) {
 
     // Send email via Resend
     await resend.emails.send({
-      from: process.env.FROM_EMAIL || 'noreply@amalite.com',
+      from: `Amalite <${process.env.FROM_EMAIL || 'noreply@amalite.org'}>`,
       to: email,
       subject: 'Your Amalite verification code',
       html: `
