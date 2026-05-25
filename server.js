@@ -20,7 +20,7 @@ const model = genAI.getGenerativeModel({
   generationConfig: {
     temperature: 0.7,
     topP: 0.9,
-    maxOutputTokens: 2048,
+    maxOutputTokens: 8192,
   },
 });
 // Initialize Razorpay
@@ -82,7 +82,7 @@ const otpLimiter = rateLimit({
 app.get('/health', function(req, res) {
   res.json({
     status: 'Amalite backend is running',
-    version: '8.1 (OTP Auth + Gemini)',
+    version: '8.2 (OTP Auth + Gemini)',
     model: 'gemini-2.5-flash',
     hasGeminiKey: !!process.env.GEMINI_API_KEY,
     hasRazorpay: !!process.env.RAZORPAY_KEY_ID,
@@ -266,5 +266,5 @@ app.post('/payment/verify', async function(req, res) {
 
 var PORT = process.env.PORT || 3000;
 app.listen(PORT, function() {
-  console.log('Amalite backend v8.1 running on port ' + PORT);
+  console.log('Amalite backend v8.2 running on port ' + PORT);
 });
