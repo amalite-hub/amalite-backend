@@ -7,11 +7,36 @@ const rateLimit = require('express-rate-limit');
 const { Pool } = require('pg');
 const { Resend } = require('resend');
 require('dotenv').config();
+const cheerio = require('cheerio');
 
 const app = express();
 app.set('trust proxy', 1);
 app.use(cors({ origin: '*', methods: ['GET', 'POST'], allowedHeaders: ['Content-Type'] }));
 app.use(express.json({ limit: '20mb' }));
+
+// ─── SECURITY: Validate API key on protected routes ──────────
+function requireApiKey(req, res, next) {
+  var key = req.headers['x-api-key'] || req.headers['authorization'];
+  var validKey = process.env.API_SECRET_KEY || 'amalite-dev-key-2026';
+  if (!key || key.replace('Bearer ', '') !== validKey) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+}
+
+// ─── SECURITY: Validate user session ─────────────────────────
+async function requireUser(req, res, next) {
+  var userId = req.body.user_id || req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'User ID required' });
+  try {
+    var result = await pool.query('SELECT * FROM users WHERE google_id = $1', [userId]);
+    if (result.rows.length === 0) return res.status(401).json({ error: 'User not found' });
+    req.user = result.rows[0];
+    next();
+  } catch(e) {
+    res.status(500).json({ error: 'Auth check failed' });
+  }
+}
 
 // Initialize Gemini
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -91,10 +116,33 @@ app.get('/health', function(req, res) {
 });
 
 // ─── GENERATE ─────────────────────────────────────────────────────────────────
-app.post('/generate', async function(req, res) {
+app.post('/generate', requireApiKey, async function(req, res) {
   var system = req.body.system || '';
   var message = req.body.message;
+  var userId = req.body.user_id || '';
+
   if (!message) return res.status(400).json({ error: 'message required' });
+
+  // Input length limit
+  if (message.length > 20000) return res.status(400).json({ error: 'Job description too long' });
+
+  // Server-side proposal count enforcement
+  if (userId) {
+    try {
+      var userResult = await pool.query('SELECT * FROM users WHERE google_id = $1', [userId]);
+      if (userResult.rows.length > 0) {
+        var user = userResult.rows[0];
+        var FREE_LIMIT = 100; // 100 free proposals server-side
+        if (!user.is_pro && user.proposal_count >= FREE_LIMIT) {
+          return res.status(403).json({ error: 'Free proposal limit reached. Please upgrade to Pro.' });
+        }
+        // Increment proposal count
+        await pool.query('UPDATE users SET proposal_count = proposal_count + 1 WHERE google_id = $1', [userId]);
+      }
+    } catch(e) {
+      console.error('Proposal count check error:', e.message);
+    }
+  }
 
   try {
     const fullPrompt = system + '\n\n' + message;
@@ -253,14 +301,111 @@ app.post('/payment/verify', async function(req, res) {
 
     if (expectedSignature === signature) {
       if (user_id) {
+        // Verify user exists in DB before granting Pro
+        var userCheck = await pool.query('SELECT id FROM users WHERE google_id = $1', [user_id]);
+        if (userCheck.rows.length === 0) {
+          return res.status(400).json({ success: false, error: 'Invalid user' });
+        }
         await pool.query('UPDATE users SET is_pro = TRUE WHERE google_id = $1', [user_id]);
+        console.log('Pro activated for user:', user_id, 'payment:', payment_id);
       }
       res.json({ success: true, is_pro: true, payment_id: payment_id });
     } else {
+      console.error('Invalid payment signature attempt for order:', order_id);
       res.status(400).json({ success: false, error: 'Invalid payment signature' });
     }
   } catch (error) {
     res.status(500).json({ success: false, error: 'Verification failed' });
+  }
+});
+
+// ─── UPWORK PROFILE IMPORT ─────────────────────────────────────────────────
+app.post('/import-profile', async function(req, res) {
+  var url = (req.body.url || '').trim();
+  if (!url) return res.status(400).json({ error: 'Upwork profile URL required' });
+  if (!url.startsWith('http')) url = 'https://' + url;
+  if (!url.includes('upwork.com')) return res.status(400).json({ error: 'Please provide a valid Upwork profile URL' });
+
+  try {
+    var response = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+    });
+
+    if (!response.ok) return res.status(400).json({ error: 'Could not access Upwork profile. Status: ' + response.status });
+
+    var html = await response.text();
+    var $ = cheerio.load(html);
+    var profileData = { name: '', title: '', location: '', rate: '', bio: '', skills: [], jobSuccess: '' };
+
+    // Try JSON-LD
+    $('script[type="application/ld+json"]').each(function() {
+      try {
+        var ld = JSON.parse($(this).html());
+        if (ld.name) profileData.name = profileData.name || ld.name;
+        if (ld.description) profileData.bio = profileData.bio || ld.description;
+        if (ld.jobTitle) profileData.title = profileData.title || ld.jobTitle;
+        if (ld.address) {
+          var loc = ld.address.addressLocality || '';
+          var country = ld.address.addressCountry || '';
+          if (typeof country === 'object') country = country.name || '';
+          profileData.location = profileData.location || [loc, country].filter(Boolean).join(', ');
+        }
+        if (ld.makesOffer && ld.makesOffer.priceSpecification) {
+          profileData.rate = profileData.rate || String(ld.makesOffer.priceSpecification.price || '');
+        }
+      } catch(e) {}
+    });
+
+    // Try meta tags
+    if (!profileData.name) {
+      var ogTitle = $('meta[property="og:title"]').attr('content') || '';
+      var parts = ogTitle.split(' - ');
+      if (parts.length >= 1) profileData.name = parts[0].trim().replace(/\|.*/, '').trim();
+      if (parts.length >= 2) profileData.title = profileData.title || parts[1].replace(/\|.*/, '').trim();
+    }
+    if (!profileData.bio) {
+      profileData.bio = $('meta[property="og:description"]').attr('content') || '';
+    }
+
+    // Skills
+    $('[data-qa="skill-tag"], .o-tag, .up-skill-badge, .air3-badge').each(function() {
+      var skill = $(this).text().trim();
+      if (skill && skill.length < 60 && !profileData.skills.includes(skill)) {
+        profileData.skills.push(skill);
+      }
+    });
+
+    // Job success
+    var jsMatch = html.match(/jobSuccessScore['"\s:]+([\d]+)/i);
+    if (jsMatch) profileData.jobSuccess = jsMatch[1] + '%';
+
+    if (!profileData.name && !profileData.title && !profileData.bio) {
+      return res.status(400).json({ error: 'Could not extract profile data. Make sure your Upwork profile is public.' });
+    }
+
+    if (profileData.bio && profileData.bio.length > 500) profileData.bio = profileData.bio.slice(0, 500);
+    console.log('Profile imported:', profileData.name, '|', profileData.title);
+    res.json({ success: true, profile: profileData });
+  } catch (error) {
+    console.error('/import-profile error:', error.message);
+    res.status(500).json({ error: 'Import failed: ' + error.message });
+  }
+});
+
+// ─── GET USER PRO STATUS ──────────────────────────────────────────────────────
+app.post('/user/status', requireApiKey, async function(req, res) {
+  var userId = req.body.user_id;
+  if (!userId) return res.status(400).json({ error: 'user_id required' });
+  try {
+    var result = await pool.query('SELECT is_pro, proposal_count FROM users WHERE google_id = $1', [userId]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    res.json({ is_pro: result.rows[0].is_pro, proposal_count: result.rows[0].proposal_count });
+  } catch(e) {
+    res.status(500).json({ error: 'Status check failed' });
   }
 });
 
