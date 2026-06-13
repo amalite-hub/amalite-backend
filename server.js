@@ -107,7 +107,7 @@ const otpLimiter = rateLimit({
 app.get('/health', function(req, res) {
   res.json({
     status: 'Amalite backend is running',
-    version: '8.2 (OTP Auth + Gemini)',
+    version: '8.4 (AI Profile Import + Security)',
     model: 'gemini-2.5-flash',
     hasGeminiKey: !!process.env.GEMINI_API_KEY,
     hasRazorpay: !!process.env.RAZORPAY_KEY_ID,
@@ -319,7 +319,7 @@ app.post('/payment/verify', async function(req, res) {
   }
 });
 
-// ─── UPWORK PROFILE IMPORT ─────────────────────────────────────────────────
+// ─── UPWORK PROFILE IMPORT (AI PARSER METHOD) ──────────────────────────────
 app.post('/import-profile', async function(req, res) {
   var url = (req.body.url || '').trim();
   if (!url) return res.status(400).json({ error: 'Upwork profile URL required' });
@@ -327,74 +327,84 @@ app.post('/import-profile', async function(req, res) {
   if (!url.includes('upwork.com')) return res.status(400).json({ error: 'Please provide a valid Upwork profile URL' });
 
   try {
-    var response = await fetch(url, {
+    // STEP 1: Fetch via ScraperAPI to bypass Cloudflare
+    var scraperKey = process.env.SCRAPER_API_KEY || '';
+    var fetchUrl = scraperKey
+      ? 'http://api.scraperapi.com?api_key=' + scraperKey + '&url=' + encodeURIComponent(url) + '&render=false&country_code=us'
+      : url;
+
+    var fetchOptions = scraperKey ? {} : {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
-      },
-    });
+      }
+    };
 
-    if (!response.ok) return res.status(400).json({ error: 'Could not access Upwork profile. Status: ' + response.status });
+    var response = await fetch(fetchUrl, fetchOptions);
+    if (!response.ok) {
+      console.log('Fetch failed:', response.status);
+      return res.status(400).json({ error: 'Could not access Upwork profile. Make sure your profile URL is public and correct.' });
+    }
 
     var html = await response.text();
+
+    // STEP 2: Strip HTML noise, keep raw text
     var $ = cheerio.load(html);
-    var profileData = { name: '', title: '', location: '', rate: '', bio: '', skills: [], jobSuccess: '' };
+    $('script, style, noscript, nav, footer, header, iframe').remove();
+    var plainText = $('body').text().replace(/\s+/g, ' ').trim();
+    plainText = plainText.substring(0, 15000);
 
-    // Try JSON-LD
-    $('script[type="application/ld+json"]').each(function() {
-      try {
-        var ld = JSON.parse($(this).html());
-        if (ld.name) profileData.name = profileData.name || ld.name;
-        if (ld.description) profileData.bio = profileData.bio || ld.description;
-        if (ld.jobTitle) profileData.title = profileData.title || ld.jobTitle;
-        if (ld.address) {
-          var loc = ld.address.addressLocality || '';
-          var country = ld.address.addressCountry || '';
-          if (typeof country === 'object') country = country.name || '';
-          profileData.location = profileData.location || [loc, country].filter(Boolean).join(', ');
-        }
-        if (ld.makesOffer && ld.makesOffer.priceSpecification) {
-          profileData.rate = profileData.rate || String(ld.makesOffer.priceSpecification.price || '');
-        }
-      } catch(e) {}
-    });
-
-    // Try meta tags
-    if (!profileData.name) {
-      var ogTitle = $('meta[property="og:title"]').attr('content') || '';
-      var parts = ogTitle.split(' - ');
-      if (parts.length >= 1) profileData.name = parts[0].trim().replace(/\|.*/, '').trim();
-      if (parts.length >= 2) profileData.title = profileData.title || parts[1].replace(/\|.*/, '').trim();
-    }
-    if (!profileData.bio) {
-      profileData.bio = $('meta[property="og:description"]').attr('content') || '';
+    if (plainText.length < 100) {
+      return res.status(400).json({ error: 'Profile page returned empty content. Upwork may have blocked the request.' });
     }
 
-    // Skills
-    $('[data-qa="skill-tag"], .o-tag, .up-skill-badge, .air3-badge').each(function() {
-      var skill = $(this).text().trim();
-      if (skill && skill.length < 60 && !profileData.skills.includes(skill)) {
-        profileData.skills.push(skill);
-      }
-    });
+    // STEP 3: Let Gemini extract everything like a human would
+    const prompt = `You are an expert data extractor. Extract the freelancer's profile details from the raw text below scraped from an Upwork profile page.
+Return ONLY a valid JSON object. No markdown. No backticks. No explanation. Just the JSON.
 
-    // Job success
-    var jsMatch = html.match(/jobSuccessScore['"\s:]+([\d]+)/i);
-    if (jsMatch) profileData.jobSuccess = jsMatch[1] + '%';
+Required JSON structure:
+{
+  "name": "Full name of the freelancer",
+  "title": "Their professional title or headline",
+  "location": "City, Country",
+  "rate": "Hourly rate as a number only e.g. 35",
+  "bio": "Their overview/bio text (max 500 chars)",
+  "skills": ["skill1", "skill2"],
+  "languages": ["English", "etc"],
+  "jobSuccess": "Job success score as a string e.g. 95%",
+  "workHistory": [{"title": "job title", "company": "company name", "dates": "date range"}],
+  "education": [{"degree": "degree name", "institution": "school name", "dates": "year"}]
+}
 
-    if (!profileData.name && !profileData.title && !profileData.bio) {
-      return res.status(400).json({ error: 'Could not extract profile data. Make sure your Upwork profile is public.' });
+If a field cannot be found, use an empty string or empty array. Do not invent data.
+
+Raw Profile Text:
+${plainText}`;
+
+    const result = await model.generateContent(prompt);
+    let jsonString = result.response.text().trim();
+
+    // Strip markdown if Gemini adds it
+    jsonString = jsonString.replace(/^```json\n?/, '').replace(/\n?```$/, '').trim();
+
+    let profileData;
+    try {
+      profileData = JSON.parse(jsonString);
+    } catch(parseErr) {
+      console.error('JSON parse failed:', jsonString.slice(0, 200));
+      return res.status(500).json({ error: 'AI could not parse profile data. Please try again.' });
     }
 
-    if (profileData.bio && profileData.bio.length > 500) profileData.bio = profileData.bio.slice(0, 500);
-    console.log('Profile imported:', profileData.name, '|', profileData.title);
+    console.log('Profile imported via AI:', profileData.name, '|', profileData.title);
     res.json({ success: true, profile: profileData });
+
   } catch (error) {
     console.error('/import-profile error:', error.message);
     res.status(500).json({ error: 'Import failed: ' + error.message });
   }
 });
+
 
 // ─── GET USER PRO STATUS ──────────────────────────────────────────────────────
 app.post('/user/status', requireApiKey, async function(req, res) {
