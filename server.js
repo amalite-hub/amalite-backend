@@ -107,7 +107,7 @@ const otpLimiter = rateLimit({
 app.get('/health', function(req, res) {
   res.json({
     status: 'Amalite backend is running',
-    version: '8.5 (Full Profile Import + Security)',
+    version: '8.6 (Retry Logic + Fallback Model)',
     model: 'gemini-2.5-flash',
     hasGeminiKey: !!process.env.GEMINI_API_KEY,
     hasRazorpay: !!process.env.RAZORPAY_KEY_ID,
@@ -360,6 +360,11 @@ app.post('/import-profile', async function(req, res) {
     }
 
     // STEP 3: Let Gemini extract everything like a human would
+    // Use fallback model if primary is overloaded
+    const importModel = genAI.getGenerativeModel({
+      model: 'gemini-1.5-flash',
+      generationConfig: { temperature: 0.1, maxOutputTokens: 2048 },
+    });
     const prompt = `You are an expert data extractor. Extract the freelancer's profile details from the raw text below scraped from an Upwork profile page.
 Return ONLY a valid JSON object. No markdown. No backticks. No explanation. Just the JSON.
 
@@ -382,8 +387,19 @@ If a field cannot be found, use an empty string or empty array. Do not invent da
 Raw Profile Text:
 ${plainText}`;
 
-    const result = await model.generateContent(prompt);
-    let jsonString = result.response.text().trim();
+    let jsonString = '';
+    for (var attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const activeModel = attempt <= 2 ? importModel : model;
+        const result = await activeModel.generateContent(prompt);
+        jsonString = result.response.text().trim();
+        break;
+      } catch(retryErr) {
+        console.log('Import AI attempt', attempt, 'failed:', retryErr.message);
+        if (attempt === 3) throw retryErr;
+        await new Promise(function(r) { setTimeout(r, 2000 * attempt); });
+      }
+    }
 
     // Strip markdown if Gemini adds it
     jsonString = jsonString.replace(/^```json\n?/, '').replace(/\n?```$/, '').trim();
