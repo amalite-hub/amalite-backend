@@ -107,7 +107,7 @@ const otpLimiter = rateLimit({
 app.get('/health', function(req, res) {
   res.json({
     status: 'Amalite backend is running',
-    version: '8.4 (AI Profile Import + Security)',
+    version: '8.5 (Full Profile Import + Security)',
     model: 'gemini-2.5-flash',
     hasGeminiKey: !!process.env.GEMINI_API_KEY,
     hasRazorpay: !!process.env.RAZORPAY_KEY_ID,
@@ -330,7 +330,7 @@ app.post('/import-profile', async function(req, res) {
     // STEP 1: Fetch via ScraperAPI to bypass Cloudflare
     var scraperKey = process.env.SCRAPER_API_KEY || '';
     var fetchUrl = scraperKey
-      ? 'http://api.scraperapi.com?api_key=' + scraperKey + '&url=' + encodeURIComponent(url) + '&render=false&country_code=us'
+      ? 'http://api.scraperapi.com?api_key=' + scraperKey + '&url=' + encodeURIComponent(url) + '&render=true&country_code=us'
       : url;
 
     var fetchOptions = scraperKey ? {} : {
@@ -353,7 +353,7 @@ app.post('/import-profile', async function(req, res) {
     var $ = cheerio.load(html);
     $('script, style, noscript, nav, footer, header, iframe').remove();
     var plainText = $('body').text().replace(/\s+/g, ' ').trim();
-    plainText = plainText.substring(0, 15000);
+    plainText = plainText.substring(0, 25000);
 
     if (plainText.length < 100) {
       return res.status(400).json({ error: 'Profile page returned empty content. Upwork may have blocked the request.' });
