@@ -107,7 +107,7 @@ const otpLimiter = rateLimit({
 app.get('/health', function(req, res) {
   res.json({
     status: 'Amalite backend is running',
-    version: '8.7 (Stable Cheerio Import)',
+    version: '8.8 (Direct Fetch - Original Working Method)',
     model: 'gemini-2.5-flash',
     hasGeminiKey: !!process.env.GEMINI_API_KEY,
     hasRazorpay: !!process.env.RAZORPAY_KEY_ID,
@@ -327,23 +327,20 @@ app.post('/import-profile', async function(req, res) {
   if (!url.includes('upwork.com')) return res.status(400).json({ error: 'Please provide a valid Upwork profile URL' });
 
   try {
-    var scraperKey = process.env.SCRAPER_API_KEY || '';
-    var fetchUrl = scraperKey
-      ? 'http://api.scraperapi.com?api_key=' + scraperKey + '&url=' + encodeURIComponent(url) + '&render=false&country_code=us'
-      : url;
+    console.log('Importing Upwork profile:', url);
 
-    var fetchOptions = scraperKey ? {} : {
+    var response = await fetch(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
-      }
-    };
+        'Cache-Control': 'no-cache',
+      },
+    });
 
-    var response = await fetch(fetchUrl, fetchOptions);
     if (!response.ok) {
-      console.log('Fetch failed:', response.status);
-      return res.status(400).json({ error: 'Could not access Upwork profile. Make sure your profile is public.' });
+      console.log('Upwork fetch failed:', response.status);
+      return res.status(400).json({ error: 'Could not access Upwork profile. Status: ' + response.status });
     }
 
     var html = await response.text();
@@ -354,21 +351,23 @@ app.post('/import-profile', async function(req, res) {
       bio: '', skills: [], jobSuccess: '',
     };
 
-    // Try JSON-LD structured data first
+    // Try JSON-LD structured data first (most reliable)
     $('script[type="application/ld+json"]').each(function() {
       try {
         var ld = JSON.parse($(this).html());
-        if (ld.name) profileData.name = profileData.name || ld.name;
-        if (ld.description) profileData.bio = profileData.bio || ld.description;
-        if (ld.jobTitle) profileData.title = profileData.title || ld.jobTitle;
-        if (ld.address) {
-          var loc = ld.address.addressLocality || '';
-          var country = ld.address.addressCountry || '';
-          if (typeof country === 'object') country = country.name || '';
-          profileData.location = profileData.location || [loc, country].filter(Boolean).join(', ');
-        }
-        if (ld.makesOffer && ld.makesOffer.priceSpecification) {
-          profileData.rate = profileData.rate || String(ld.makesOffer.priceSpecification.price || '');
+        if (ld['@type'] === 'Person' || ld.name) {
+          profileData.name = ld.name || profileData.name;
+          if (ld.address) {
+            var loc = ld.address.addressLocality || '';
+            var country = ld.address.addressCountry || '';
+            if (country && typeof country === 'object') country = country.name || '';
+            profileData.location = [loc, country].filter(Boolean).join(', ');
+          }
+          if (ld.description) profileData.bio = ld.description;
+          if (ld.jobTitle) profileData.title = ld.jobTitle;
+          if (ld.makesOffer && ld.makesOffer.priceSpecification) {
+            profileData.rate = ld.makesOffer.priceSpecification.price || '';
+          }
         }
       } catch(e) {}
     });
@@ -376,41 +375,77 @@ app.post('/import-profile', async function(req, res) {
     // Try meta tags
     if (!profileData.name) {
       var ogTitle = $('meta[property="og:title"]').attr('content') || '';
-      var parts = ogTitle.split(' - ');
-      if (parts[0]) profileData.name = parts[0].replace(/|.*/, '').trim();
-      if (parts[1]) profileData.title = profileData.title || parts[1].replace(/|.*/, '').trim();
-    }
-    if (!profileData.bio) {
-      profileData.bio = $('meta[property="og:description"]').attr('content') || '';
+      if (ogTitle) {
+        var parts = ogTitle.split(' - ');
+        if (parts.length >= 1) profileData.name = parts[0].trim();
+        if (parts.length >= 2) profileData.title = parts[1].replace(/\|.*/, '').trim();
+      }
     }
 
-    // Extract skills
-    $('[data-qa="skill-tag"], .o-tag, .up-skill-badge, .air3-badge').each(function() {
+    if (!profileData.bio) {
+      var ogDesc = $('meta[property="og:description"]').attr('content') || '';
+      if (ogDesc) profileData.bio = ogDesc;
+    }
+
+    // Try common HTML selectors
+    if (!profileData.name) {
+      profileData.name = $('h1.profile-title, [data-qa="profile-title"], .identity-name').first().text().trim() || '';
+    }
+    if (!profileData.title) {
+      profileData.title = $('h2.profile-title, [data-qa="profile-specialization"], .profile-specialization').first().text().trim() || '';
+    }
+    if (!profileData.location) {
+      profileData.location = $('[data-qa="profile-location"], .location, .city-country').first().text().trim() || '';
+    }
+    if (!profileData.rate) {
+      var rateText = $('[data-qa="hourly-rate"], .hourly-rate').first().text().trim() || '';
+      var rateMatch = rateText.match(/\$([\d.]+)/);
+      if (rateMatch) profileData.rate = rateMatch[1];
+    }
+
+    // Extract skills from skill tags
+    $('[data-qa="skill-tag"], .skill-badge, .o-tag, .skills-list span, .up-skill-badge, [class*="skill"]').each(function() {
       var skill = $(this).text().trim();
-      if (skill && skill.length > 1 && skill.length < 60 && !profileData.skills.includes(skill)) {
+      if (skill && skill.length < 50 && !profileData.skills.includes(skill)) {
         profileData.skills.push(skill);
       }
     });
 
-    // Job success score from raw HTML
-    var jsMatch = html.match(/jobSuccessScore['"\s:]+(\d+)/i);
+    // Try extracting skills from page text via regex
+    if (profileData.skills.length === 0) {
+      var skillMatches = html.match(/"skills":\s*\[([^\]]+)\]/);
+      if (skillMatches) {
+        try {
+          var parsed = JSON.parse('[' + skillMatches[1] + ']');
+          parsed.forEach(function(s) {
+            var name = typeof s === 'string' ? s : (s.name || s.label || '');
+            if (name && !profileData.skills.includes(name)) profileData.skills.push(name);
+          });
+        } catch(e) {}
+      }
+    }
+
+    // Try extracting job success score
+    var jsMatch = html.match(/jobSuccessScore['"\s:]+([\d]+)/i);
     if (jsMatch) profileData.jobSuccess = jsMatch[1] + '%';
     if (!profileData.jobSuccess) {
-      var jssMatch = html.match(/(\d+)%\s*[Jj]ob\s*[Ss]uccess/);
-      if (jssMatch) profileData.jobSuccess = jssMatch[1] + '%';
+      var jssText = $('[data-qa="job-success-score"]').first().text().trim();
+      if (jssText) profileData.jobSuccess = jssText;
     }
 
-    if (profileData.bio && profileData.bio.length > 600) {
-      profileData.bio = profileData.bio.slice(0, 600);
+    // Clean up bio
+    if (profileData.bio && profileData.bio.length > 500) {
+      profileData.bio = profileData.bio.substring(0, 500);
     }
 
-    if (!profileData.name && !profileData.title && profileData.skills.length === 0) {
+    if (!profileData.name && !profileData.title && !profileData.bio) {
       return res.status(400).json({
-        error: 'Could not extract profile data. Make sure your Upwork profile URL is public and correct.'
+        error: 'Could not extract profile data. Upwork may have blocked the request. Try again or enter your details manually.',
+        partial: profileData
       });
     }
 
-    console.log('Profile imported:', profileData.name, '|', profileData.title, '| skills:', profileData.skills.length);
+    console.log('Profile imported:', profileData.name, '|', profileData.title);
     res.json({ success: true, profile: profileData });
 
   } catch (error) {
