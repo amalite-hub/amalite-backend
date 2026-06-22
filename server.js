@@ -107,7 +107,7 @@ const otpLimiter = rateLimit({
 app.get('/health', function(req, res) {
   res.json({
     status: 'Amalite backend is running',
-    version: '8.9 (ScraperAPI render=true - Full Profile Import)',
+    version: '9.0 (ScraperAPI + NUXT payload regex extraction)',
     model: 'gemini-2.5-flash',
     hasGeminiKey: !!process.env.GEMINI_API_KEY,
     hasRazorpay: !!process.env.RAZORPAY_KEY_ID,
@@ -376,119 +376,110 @@ app.post('/import-profile', async function(req, res) {
       bio: '', skills: [], jobSuccess: '',
     };
 
-    // Try JSON-LD structured data first (most reliable)
+    // PRIMARY STRATEGY: Upwork embeds profile data server-side inside a minified
+    // window.__NUXT__ JS payload (not clean JSON, not plain HTML attributes).
+    // CSS-selector scraping fails here because class names are hashed/obfuscated
+    // (e.g. data-v-3dee3f5a) and the real data lives in that giant script tag.
+    // So we extract directly from known reliable signals instead:
+
+    // og:title / og:description meta tags are reliably populated server-side
+    var ogTitle = $('meta[property="og:title"]').attr('content') || '';
+    if (ogTitle) {
+      profileData.name = ogTitle.trim();
+    }
+    var ogDesc = $('meta[property="og:description"]').attr('content') || '';
+    if (ogDesc) {
+      // og:description is usually "Workflow Automation Expert | Excel VBA..."
+      profileData.title = ogDesc.replace(/^View .*? profile on Upwork.*$/i, '').trim();
+    }
+    // The <title> tag reliably contains "Name - Title - Upwork Freelancer from City, Country"
+    var pageTitle = $('title').first().text() || '';
+    var titleParts = pageTitle.split(' - ');
+    if (titleParts.length >= 3) {
+      if (!profileData.name) profileData.name = titleParts[0].trim();
+      if (!profileData.title) profileData.title = titleParts[1].trim();
+      var fromMatch = pageTitle.match(/Upwork Freelancer from (.+)$/i);
+      if (fromMatch) profileData.location = fromMatch[1].trim();
+    }
+
+    // Extract from JSON-LD if present
     $('script[type="application/ld+json"]').each(function() {
       try {
         var ld = JSON.parse($(this).html());
-        if (ld['@type'] === 'Person' || ld.name) {
-          profileData.name = ld.name || profileData.name;
-          if (ld.address) {
-            var loc = ld.address.addressLocality || '';
-            var country = ld.address.addressCountry || '';
-            if (country && typeof country === 'object') country = country.name || '';
-            profileData.location = [loc, country].filter(Boolean).join(', ');
-          }
-          if (ld.description) profileData.bio = ld.description;
-          if (ld.jobTitle) profileData.title = ld.jobTitle;
-          if (ld.makesOffer && ld.makesOffer.priceSpecification) {
-            profileData.rate = ld.makesOffer.priceSpecification.price || '';
-          }
-        }
+        if (ld.description && !profileData.bio) profileData.bio = ld.description;
+        if (ld.jobTitle && !profileData.title) profileData.title = ld.jobTitle;
       } catch(e) {}
     });
 
-    // Try meta tags
-    if (!profileData.name) {
-      var ogTitle = $('meta[property="og:title"]').attr('content') || '';
-      if (ogTitle) {
-        var parts = ogTitle.split(' - ');
-        if (parts.length >= 1) profileData.name = parts[0].trim();
-        if (parts.length >= 2) profileData.title = parts[1].replace(/\|.*/, '').trim();
-      }
+    // Extract structured data straight out of the __NUXT__ payload using targeted
+    // regex on known field labels, since it's a JS function call, not valid JSON
+    var nameMatch = html.match(/name:"([^"]{2,60})",firstName:/);
+    if (nameMatch) profileData.name = nameMatch[1];
+
+    var titleMatch = html.match(/firstName:"[^"]*",shortName:[^,]+,title:"([^"]{2,200})"/);
+    if (titleMatch) profileData.title = titleMatch[1];
+
+    var descMatch = html.match(/description:"((?:[^"\\]|\\.){10,1000})",location:/);
+    if (descMatch) {
+      try { profileData.bio = JSON.parse('"' + descMatch[1] + '"'); } catch(e) { profileData.bio = descMatch[1]; }
     }
 
-    if (!profileData.bio) {
-      var ogDesc = $('meta[property="og:description"]').attr('content') || '';
-      if (ogDesc) profileData.bio = ogDesc;
+    var cityMatch = html.match(/country:"([^"]+)",city:"([^"]+)"/);
+    if (cityMatch) profileData.location = cityMatch[2] + ', ' + cityMatch[1];
+
+    var rateMatch = html.match(/hourlyRate:\{currencyCode:"USD",amount:([\d.]+)\}/);
+    if (rateMatch) profileData.rate = rateMatch[1];
+
+    // Job Success score: the rendered badge text "91%" + "Job Success" label is unambiguous.
+    // (nSS100BwScore is an internal decimal score, not reliably the same as the displayed %.)
+    var jssAlt = html.match(/(\d{1,3})%\s*<\/span>\s*<span[^>]*>\s*Job Success/i);
+    if (jssAlt) profileData.jobSuccess = jssAlt[1] + '%';
+
+    // Skills appear as prettyName:"X" pairs scattered through the skills array
+    var skillMatches = html.match(/prettyName:"([^"]{2,40})"/g);
+    if (skillMatches) {
+      skillMatches.forEach(function(m) {
+        var name = m.match(/prettyName:"([^"]+)"/)[1];
+        if (name && !profileData.skills.includes(name) && profileData.skills.length < 30) {
+          profileData.skills.push(name);
+        }
+      });
     }
 
-    // Try common HTML selectors
-    if (!profileData.name) {
-      profileData.name = $('h1.profile-title, [data-qa="profile-title"], .identity-name').first().text().trim() || '';
-    }
-    if (!profileData.title) {
-      profileData.title = $('h2.profile-title, [data-qa="profile-specialization"], .profile-specialization').first().text().trim() || '';
-    }
-    if (!profileData.location) {
-      profileData.location = $('[data-qa="profile-location"], .location, .city-country').first().text().trim() || '';
-    }
-    if (!profileData.rate) {
-      var rateText = $('[data-qa="hourly-rate"], .hourly-rate').first().text().trim() || '';
-      var rateMatch = rateText.match(/\$([\d.]+)/);
-      if (rateMatch) profileData.rate = rateMatch[1];
-    }
-
-    // Extract skills from skill tags
-    $('[data-qa="skill-tag"], .skill-badge, .o-tag, .skills-list span, .up-skill-badge, [class*="skill"]').each(function() {
-      var skill = $(this).text().trim();
-      if (skill && skill.length < 50 && !profileData.skills.includes(skill)) {
-        profileData.skills.push(skill);
-      }
-    });
-
-    // Try extracting skills from page text via regex
-    if (profileData.skills.length === 0) {
-      var skillMatches = html.match(/"skills":\s*\[([^\]]+)\]/);
-      if (skillMatches) {
-        try {
-          var parsed = JSON.parse('[' + skillMatches[1] + ']');
-          parsed.forEach(function(s) {
-            var name = typeof s === 'string' ? s : (s.name || s.label || '');
-            if (name && !profileData.skills.includes(name)) profileData.skills.push(name);
-          });
-        } catch(e) {}
-      }
-    }
-
-    // Try extracting job success score
-    var jsMatch = html.match(/jobSuccessScore['"\s:]+([\d]+)/i);
-    if (jsMatch) profileData.jobSuccess = jsMatch[1] + '%';
-    if (!profileData.jobSuccess) {
-      var jssText = $('[data-qa="job-success-score"]').first().text().trim();
-      if (jssText) profileData.jobSuccess = jssText;
-    }
-
-    // Work history / past projects (now accessible since render=true loads JS content)
+    // Work history — extract from __NUXT__ payload "title:" fields inside assignment objects.
+    // These appear as: title:"Some Job Title",description:"..."
     profileData.workHistory = [];
-    $('[data-qa="work-history-item"], .work-history-item, [data-test="work-history-item"]').each(function() {
-      var itemTitle = $(this).find('[data-qa="title"], .title, h4, h5').first().text().trim();
-      var itemDesc = $(this).find('[data-qa="description"], .description, p').first().text().trim();
-      if (itemTitle && profileData.workHistory.length < 10) {
-        profileData.workHistory.push({ title: itemTitle, description: itemDesc.slice(0, 300) });
-      }
-    });
+    var workHistoryRegex = /startedOn:"[^"]+",endedOn:[^,]+,totalHours:[^,]+,type:[^,]+,title:"((?:[^"\\]|\\.){3,150})",description:"((?:[^"\\]|\\.){0,400})"/g;
+    var whMatch;
+    while ((whMatch = workHistoryRegex.exec(html)) !== null && profileData.workHistory.length < 10) {
+      try {
+        var whTitle = JSON.parse('"' + whMatch[1] + '"');
+        var whDesc = JSON.parse('"' + whMatch[2] + '"').slice(0, 300);
+        if (whTitle) profileData.workHistory.push({ title: whTitle, description: whDesc });
+      } catch(e) {}
+    }
 
-    // Portfolio items
+    // Portfolio items — title fields inside the portfolios array (uid/title pairs)
     profileData.portfolio = [];
-    $('[data-qa="portfolio-item"], .portfolio-item, [data-test="portfolio-item"]').each(function() {
-      var pTitle = $(this).find('[data-qa="title"], .title, h4, h5').first().text().trim();
-      if (pTitle && profileData.portfolio.length < 10) {
-        profileData.portfolio.push(pTitle);
-      }
-    });
+    var portfolioRegex = /title:aC[,}]|title:"((?:[^"\\]|\\.){3,150})",description:aD/;
+    // Fallback: look for explicit portfolio title near "thumbnail" field
+    var portfolioRegex2 = /title:"((?:[^"\\]|\\.){3,150})",description:(?:"(?:[^"\\]|\\.){0,400}"|a[A-Z]),thumbnail:/g;
+    var pMatch;
+    while ((pMatch = portfolioRegex2.exec(html)) !== null && profileData.portfolio.length < 10) {
+      try {
+        var pTitle = JSON.parse('"' + pMatch[1] + '"');
+        if (pTitle && !profileData.portfolio.includes(pTitle)) profileData.portfolio.push(pTitle);
+      } catch(e) {}
+    }
 
-    // Education
+    // Education / employment history not reliably present for this profile type; leave empty
     profileData.education = [];
-    $('[data-qa="education-item"], .education-item, [data-test="education-item"]').each(function() {
-      var eduText = $(this).text().trim().replace(/\s+/g, ' ');
-      if (eduText && profileData.education.length < 5) {
-        profileData.education.push(eduText.slice(0, 200));
-      }
-    });
 
-    // Total earnings / total jobs (extra credibility signals if present)
-    var earningsMatch = html.match(/totalEarnings['"\s:]+["']?\$?([\d,]+\+?)/i);
-    if (earningsMatch) profileData.totalEarnings = earningsMatch[1];
+    // Total jobs / total hours — present as plain stats fields
+    var totalJobsMatch = html.match(/totalJobsWorked:(\d+)/);
+    if (totalJobsMatch) profileData.totalJobs = totalJobsMatch[1];
+    var totalHoursMatch = html.match(/totalHours:([\d.]+),totalHoursRecent/);
+    if (totalHoursMatch) profileData.totalHours = totalHoursMatch[1];
 
     // Clean up bio
     if (profileData.bio && profileData.bio.length > 500) {
@@ -527,5 +518,5 @@ app.post('/user/status', requireApiKey, async function(req, res) {
 
 var PORT = process.env.PORT || 3000;
 app.listen(PORT, function() {
-  console.log('Amalite backend v8.9 running on port ' + PORT);
+  console.log('Amalite backend v9.0 running on port ' + PORT);
 });
