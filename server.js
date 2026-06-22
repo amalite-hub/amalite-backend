@@ -329,18 +329,50 @@ app.post('/import-profile', async function(req, res) {
   try {
     console.log('Importing Upwork profile:', url);
 
-    var response = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Cache-Control': 'no-cache',
-      },
-    });
+    var fetchHeaders = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache',
+      'Sec-Ch-Ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+      'Sec-Ch-Ua-Mobile': '?0',
+      'Sec-Ch-Ua-Platform': '"Windows"',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Sec-Fetch-User': '?1',
+      'Upgrade-Insecure-Requests': '1',
+      'Referer': 'https://www.google.com/',
+      'Connection': 'keep-alive',
+    };
+
+    var response = null;
+    var lastStatus = 0;
+    for (var attempt = 1; attempt <= 3; attempt++) {
+      response = await fetch(url, { headers: fetchHeaders, redirect: 'follow' });
+      lastStatus = response.status;
+      if (response.ok) break;
+      console.log('Import attempt', attempt, 'failed with status', lastStatus);
+      if (attempt < 3) {
+        var delay = 800 + Math.floor(Math.random() * 900) + (attempt * 500);
+        await new Promise(function(r) { setTimeout(r, delay); });
+      }
+    }
+
+    // If Upwork returns a CAPTCHA/block page disguised as 200, detect it
+    if (response.ok) {
+      var peekText = await response.clone().text();
+      if (peekText.length < 2000 && (peekText.toLowerCase().includes('captcha') || peekText.toLowerCase().includes('access denied') || peekText.toLowerCase().includes('blocked'))) {
+        console.log('Upwork returned a block/captcha page disguised as 200');
+        return res.status(403).json({ error: 'Upwork blocked this request after multiple attempts. Please try again shortly, or fill in your profile manually.' });
+      }
+    }
 
     if (!response.ok) {
-      console.log('Upwork fetch failed:', response.status);
-      return res.status(400).json({ error: 'Could not access Upwork profile. Status: ' + response.status });
+      console.log('Upwork fetch failed after 3 attempts:', lastStatus);
+      return res.status(400).json({ error: 'Could not access Upwork profile after several attempts (status ' + lastStatus + '). Please try again shortly, or fill in your profile manually.' });
     }
 
     var html = await response.text();
