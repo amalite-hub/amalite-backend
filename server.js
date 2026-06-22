@@ -107,7 +107,7 @@ const otpLimiter = rateLimit({
 app.get('/health', function(req, res) {
   res.json({
     status: 'Amalite backend is running',
-    version: '8.8 (Direct Fetch - Original Working Method)',
+    version: '8.9 (ScraperAPI render=true - Full Profile Import)',
     model: 'gemini-2.5-flash',
     hasGeminiKey: !!process.env.GEMINI_API_KEY,
     hasRazorpay: !!process.env.RAZORPAY_KEY_ID,
@@ -327,56 +327,49 @@ app.post('/import-profile', async function(req, res) {
   if (!url.includes('upwork.com')) return res.status(400).json({ error: 'Please provide a valid Upwork profile URL' });
 
   try {
-    console.log('Importing Upwork profile:', url);
+    console.log('Importing Upwork profile via ScraperAPI:', url);
 
-    var fetchHeaders = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Accept-Encoding': 'gzip, deflate, br',
-      'Cache-Control': 'no-cache',
-      'Pragma': 'no-cache',
-      'Sec-Ch-Ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-      'Sec-Ch-Ua-Mobile': '?0',
-      'Sec-Ch-Ua-Platform': '"Windows"',
-      'Sec-Fetch-Dest': 'document',
-      'Sec-Fetch-Mode': 'navigate',
-      'Sec-Fetch-Site': 'none',
-      'Sec-Fetch-User': '?1',
-      'Upgrade-Insecure-Requests': '1',
-      'Referer': 'https://www.google.com/',
-      'Connection': 'keep-alive',
-    };
+    var scraperKey = process.env.SCRAPER_API_KEY || '';
+    if (!scraperKey) {
+      return res.status(500).json({ error: 'Import service not configured. Please contact support.' });
+    }
+
+    // render=true loads JavaScript so skills/portfolio sections actually appear in the HTML
+    var scraperUrl = 'https://api.scraperapi.com/?api_key=' + scraperKey
+      + '&url=' + encodeURIComponent(url)
+      + '&render=true'
+      + '&country_code=us'
+      + '&wait_for_selector=' + encodeURIComponent('[data-qa="freelancer-info"], .up-profile-header, body');
 
     var response = null;
     var lastStatus = 0;
-    for (var attempt = 1; attempt <= 3; attempt++) {
-      response = await fetch(url, { headers: fetchHeaders, redirect: 'follow' });
-      lastStatus = response.status;
-      if (response.ok) break;
-      console.log('Import attempt', attempt, 'failed with status', lastStatus);
-      if (attempt < 3) {
-        var delay = 800 + Math.floor(Math.random() * 900) + (attempt * 500);
-        await new Promise(function(r) { setTimeout(r, delay); });
+    for (var attempt = 1; attempt <= 2; attempt++) {
+      try {
+        response = await fetch(scraperUrl, { method: 'GET' });
+        lastStatus = response.status;
+        if (response.ok) break;
+        console.log('ScraperAPI attempt', attempt, 'failed with status', lastStatus);
+      } catch (fetchErr) {
+        console.log('ScraperAPI attempt', attempt, 'threw:', fetchErr.message);
+        lastStatus = 0;
+      }
+      if (attempt < 2) {
+        await new Promise(function(r) { setTimeout(r, 1500); });
       }
     }
 
-    // If Upwork returns a CAPTCHA/block page disguised as 200, detect it
-    if (response.ok) {
-      var peekText = await response.clone().text();
-      if (peekText.length < 2000 && (peekText.toLowerCase().includes('captcha') || peekText.toLowerCase().includes('access denied') || peekText.toLowerCase().includes('blocked'))) {
-        console.log('Upwork returned a block/captcha page disguised as 200');
-        return res.status(403).json({ error: 'Upwork blocked this request after multiple attempts. Please try again shortly, or fill in your profile manually.' });
-      }
-    }
-
-    if (!response.ok) {
-      console.log('Upwork fetch failed after 3 attempts:', lastStatus);
-      return res.status(400).json({ error: 'Could not access Upwork profile after several attempts (status ' + lastStatus + '). Please try again shortly, or fill in your profile manually.' });
+    if (!response || !response.ok) {
+      console.log('ScraperAPI fetch failed after retries:', lastStatus);
+      return res.status(400).json({ error: 'Could not access Upwork profile (status ' + lastStatus + '). Please try again shortly, or fill in your profile manually.' });
     }
 
     var html = await response.text();
     var $ = cheerio.load(html);
+
+    if (html.length < 500) {
+      console.log('ScraperAPI returned suspiciously short content, length:', html.length);
+      return res.status(400).json({ error: 'Could not load full profile content. Please try again, or fill in manually.' });
+    }
 
     var profileData = {
       name: '', title: '', location: '', rate: '',
@@ -465,19 +458,51 @@ app.post('/import-profile', async function(req, res) {
       if (jssText) profileData.jobSuccess = jssText;
     }
 
+    // Work history / past projects (now accessible since render=true loads JS content)
+    profileData.workHistory = [];
+    $('[data-qa="work-history-item"], .work-history-item, [data-test="work-history-item"]').each(function() {
+      var itemTitle = $(this).find('[data-qa="title"], .title, h4, h5').first().text().trim();
+      var itemDesc = $(this).find('[data-qa="description"], .description, p').first().text().trim();
+      if (itemTitle && profileData.workHistory.length < 10) {
+        profileData.workHistory.push({ title: itemTitle, description: itemDesc.slice(0, 300) });
+      }
+    });
+
+    // Portfolio items
+    profileData.portfolio = [];
+    $('[data-qa="portfolio-item"], .portfolio-item, [data-test="portfolio-item"]').each(function() {
+      var pTitle = $(this).find('[data-qa="title"], .title, h4, h5').first().text().trim();
+      if (pTitle && profileData.portfolio.length < 10) {
+        profileData.portfolio.push(pTitle);
+      }
+    });
+
+    // Education
+    profileData.education = [];
+    $('[data-qa="education-item"], .education-item, [data-test="education-item"]').each(function() {
+      var eduText = $(this).text().trim().replace(/\s+/g, ' ');
+      if (eduText && profileData.education.length < 5) {
+        profileData.education.push(eduText.slice(0, 200));
+      }
+    });
+
+    // Total earnings / total jobs (extra credibility signals if present)
+    var earningsMatch = html.match(/totalEarnings['"\s:]+["']?\$?([\d,]+\+?)/i);
+    if (earningsMatch) profileData.totalEarnings = earningsMatch[1];
+
     // Clean up bio
     if (profileData.bio && profileData.bio.length > 500) {
       profileData.bio = profileData.bio.substring(0, 500);
     }
 
-    if (!profileData.name && !profileData.title && !profileData.bio) {
+    if (!profileData.name && !profileData.title && !profileData.bio && profileData.skills.length === 0) {
       return res.status(400).json({
-        error: 'Could not extract profile data. Upwork may have blocked the request. Try again or enter your details manually.',
+        error: 'Could not extract profile data. The page may not have loaded fully. Try again or enter your details manually.',
         partial: profileData
       });
     }
 
-    console.log('Profile imported:', profileData.name, '|', profileData.title);
+    console.log('Profile imported:', profileData.name, '|', profileData.title, '| skills:', profileData.skills.length, '| workHistory:', profileData.workHistory.length);
     res.json({ success: true, profile: profileData });
 
   } catch (error) {
@@ -502,5 +527,5 @@ app.post('/user/status', requireApiKey, async function(req, res) {
 
 var PORT = process.env.PORT || 3000;
 app.listen(PORT, function() {
-  console.log('Amalite backend v8.2 running on port ' + PORT);
+  console.log('Amalite backend v8.9 running on port ' + PORT);
 });
