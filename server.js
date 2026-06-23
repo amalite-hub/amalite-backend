@@ -7,6 +7,8 @@ const rateLimit = require('express-rate-limit');
 const { Pool } = require('pg');
 const { Resend } = require('resend');
 require('dotenv').config();
+const { OAuth2Client } = require('google-auth-library');
+const googleClient = new OAuth2Client(process.env.GOOGLE_WEB_CLIENT_ID);
 const cheerio = require('cheerio');
 
 const app = express();
@@ -16,8 +18,12 @@ app.use(express.json({ limit: '20mb' }));
 
 // ─── SECURITY: Validate API key on protected routes ──────────
 function requireApiKey(req, res, next) {
+  var validKey = process.env.API_SECRET_KEY;
+  if (!validKey) {
+    console.error('FATAL: API_SECRET_KEY env var not set — refusing all authenticated requests');
+    return res.status(500).json({ error: 'Server misconfigured' });
+  }
   var key = req.headers['x-api-key'] || req.headers['authorization'];
-  var validKey = process.env.API_SECRET_KEY || 'amalite-dev-key-2026';
   if (!key || key.replace('Bearer ', '') !== validKey) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
@@ -83,11 +89,26 @@ pool.query(`
     email TEXT UNIQUE,
     is_pro BOOLEAN DEFAULT FALSE,
     proposal_count INTEGER DEFAULT 0,
+    photo_url TEXT,
     created_at TIMESTAMP DEFAULT NOW()
   )
 `).then(function() {
   console.log('Users table ready');
+  // Add photo_url column if upgrading from an older schema that didn't have it
+  return pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_url TEXT`);
 }).catch(function(err) { console.error('Users table create error:', err.message); });
+
+// Tracks emails that have already used a free trial, even after the user
+// account row itself is deleted, so deleting + re-signing up with the same
+// email cannot grant a second free trial.
+pool.query(`
+  CREATE TABLE IF NOT EXISTS used_emails (
+    email TEXT PRIMARY KEY,
+    first_seen_at TIMESTAMP DEFAULT NOW()
+  )
+`).then(function() {
+  console.log('Used emails table ready');
+}).catch(function(err) { console.error('Used emails table create error:', err.message); });
 
 const limiter = rateLimit({
   windowMs: 60 * 1000,
@@ -101,6 +122,14 @@ const otpLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
   max: 5,
   message: { error: 'Too many OTP requests. Please wait 10 minutes.' },
+});
+
+// OTP verify limiter - max 10 verification attempts per 10 minutes per IP,
+// to prevent brute-forcing the 6-digit code within its expiry window.
+const otpVerifyLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 10,
+  message: { error: 'Too many attempts. Please request a new code and wait 10 minutes.' },
 });
 
 // ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
@@ -177,7 +206,7 @@ app.post('/auth/send-otp', otpLimiter, async function(req, res) {
       [email, code, expiresAt]
     );
 
-    console.log('OTP stored for', email, '- code:', code);
+    console.log('OTP generated for email ending in:', email.slice(-10));
 
     // Send email via Resend
     var fromAddress = 'Amalite <' + (process.env.FROM_EMAIL || 'noreply@amalite.org') + '>';
@@ -207,7 +236,7 @@ app.post('/auth/send-otp', otpLimiter, async function(req, res) {
 });
 
 // ─── AUTH: VERIFY OTP ─────────────────────────────────────────────────────────
-app.post('/auth/verify-otp', async function(req, res) {
+app.post('/auth/verify-otp', otpVerifyLimiter, async function(req, res) {
   var email = (req.body.email || '').trim().toLowerCase();
   var code = (req.body.code || '').trim();
   var name = (req.body.name || '').trim();
@@ -216,7 +245,7 @@ app.post('/auth/verify-otp', async function(req, res) {
     return res.status(400).json({ error: 'Email and code required' });
   }
 
-  console.log('Verifying OTP for', email, 'code:', code);
+  console.log('OTP verification attempt for email ending in:', email.slice(-10));
 
   try {
     // Find valid OTP
@@ -233,19 +262,29 @@ app.post('/auth/verify-otp', async function(req, res) {
         'SELECT code, used, expires_at FROM otp_codes WHERE email = $1 ORDER BY created_at DESC LIMIT 1',
         [email]
       );
-      console.log('Latest OTP for email:', JSON.stringify(debugResult.rows));
+      console.log('No matching OTP found for this attempt');
       return res.status(400).json({ error: 'Invalid or expired code. Please request a new one.' });
     }
 
     // Mark OTP as used
     await pool.query('UPDATE otp_codes SET used = TRUE WHERE id = $1', [result.rows[0].id]);
 
+    // Check if this email has used a free trial before (even if that account was deleted)
+    var priorUseResult = await pool.query('SELECT email FROM used_emails WHERE email = $1', [email]);
+    var hasUsedTrialBefore = priorUseResult.rows.length > 0;
+
     // Create or find user using google_id column
     var userId = email.replace(/[^a-z0-9]/g, '_') + '_amalite';
     await pool.query(
-      `INSERT INTO users (google_id, name, email) VALUES ($1, $2, $3)
+      `INSERT INTO users (google_id, name, email, proposal_count) VALUES ($1, $2, $3, $4)
        ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name`,
-      [userId, name, email]
+      [userId, name, email, hasUsedTrialBefore ? 100 : 0]
+    );
+
+    // Record this email as having used a trial, so future re-signups (after deletion) can't reset it
+    await pool.query(
+      'INSERT INTO used_emails (email) VALUES ($1) ON CONFLICT (email) DO NOTHING',
+      [email]
     );
 
     // Get user
@@ -265,8 +304,61 @@ app.post('/auth/verify-otp', async function(req, res) {
   }
 });
 
+// ─── AUTH: GOOGLE SIGN-IN ──────────────────────────────────────────────────────
+app.post('/auth/google', otpLimiter, async function(req, res) {
+  var idToken = req.body.id_token;
+  if (!idToken) return res.status(400).json({ error: 'id_token required' });
+
+  try {
+    // Server-side verification of the ID token — this is the step that actually
+    // proves the token is real and was issued by Google for OUR app, not
+    // something a client could fake by just sending arbitrary name/email fields.
+    var ticket = await googleClient.verifyIdToken({
+      idToken: idToken,
+      audience: process.env.GOOGLE_WEB_CLIENT_ID,
+    });
+    var payload = ticket.getPayload();
+    var email = (payload.email || '').trim().toLowerCase();
+    var name = payload.name || 'User';
+    var photo = payload.picture || '';
+
+    if (!email) return res.status(400).json({ error: 'Google account has no email' });
+
+    // Check prior free-trial use, same logic as OTP signup
+    var priorUseResult = await pool.query('SELECT email FROM used_emails WHERE email = $1', [email]);
+    var hasUsedTrialBefore = priorUseResult.rows.length > 0;
+
+    var userId = email.replace(/[^a-z0-9]/g, '_') + '_amalite';
+    await pool.query(
+      `INSERT INTO users (google_id, name, email, photo_url, proposal_count) VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name, photo_url = EXCLUDED.photo_url`,
+      [userId, name, email, photo, hasUsedTrialBefore ? 100 : 0]
+    );
+
+    await pool.query(
+      'INSERT INTO used_emails (email) VALUES ($1) ON CONFLICT (email) DO NOTHING',
+      [email]
+    );
+
+    var userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    var user = userResult.rows[0];
+
+    res.json({
+      success: true,
+      user_id: user.google_id,
+      name: user.name,
+      email: user.email,
+      is_pro: user.is_pro,
+      photo: user.photo_url || '',
+    });
+  } catch (error) {
+    console.error('/auth/google error:', error.message);
+    res.status(401).json({ error: 'Google sign-in verification failed' });
+  }
+});
+
 // ─── RAZORPAY: CREATE ORDER ───────────────────────────────────────────────────
-app.post('/payment/create-order', async function(req, res) {
+app.post('/payment/create-order', requireApiKey, async function(req, res) {
   try {
     var order = await razorpay.orders.create({
       amount: 499,
@@ -320,11 +412,13 @@ app.post('/payment/verify', async function(req, res) {
 });
 
 // ─── UPWORK PROFILE IMPORT ─────────────────────────────────────────────────
-app.post('/import-profile', async function(req, res) {
+app.post('/import-profile', requireApiKey, async function(req, res) {
   var url = (req.body.url || '').trim();
   if (!url) return res.status(400).json({ error: 'Upwork profile URL required' });
   if (!url.startsWith('http')) url = 'https://' + url;
-  if (!url.includes('upwork.com')) return res.status(400).json({ error: 'Please provide a valid Upwork profile URL' });
+  if (!/^https:\/\/(www\.)?upwork\.com\/freelancers\//i.test(url)) {
+    return res.status(400).json({ error: 'Please provide a valid Upwork freelancer profile URL' });
+  }
 
   try {
     console.log('Importing Upwork profile via ScraperAPI:', url);
@@ -508,11 +602,27 @@ app.post('/user/status', requireApiKey, async function(req, res) {
   var userId = req.body.user_id;
   if (!userId) return res.status(400).json({ error: 'user_id required' });
   try {
-    var result = await pool.query('SELECT is_pro, proposal_count FROM users WHERE google_id = $1', [userId]);
+    var result = await pool.query('SELECT is_pro, proposal_count, photo_url FROM users WHERE google_id = $1', [userId]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
-    res.json({ is_pro: result.rows[0].is_pro, proposal_count: result.rows[0].proposal_count });
+    res.json({ is_pro: result.rows[0].is_pro, proposal_count: result.rows[0].proposal_count, photo: result.rows[0].photo_url || '' });
   } catch(e) {
     res.status(500).json({ error: 'Status check failed' });
+  }
+});
+
+// ─── DELETE USER ACCOUNT ──────────────────────────────────────────────────────
+app.post('/user/delete', requireApiKey, async function(req, res) {
+  var userId = req.body.user_id;
+  if (!userId) return res.status(400).json({ error: 'user_id required' });
+  try {
+    var result = await pool.query('DELETE FROM users WHERE google_id = $1 RETURNING email', [userId]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    // Note: row in used_emails is intentionally NOT removed — it permanently
+    // blocks this email from getting a second free trial after re-signup.
+    res.json({ success: true });
+  } catch(e) {
+    console.error('/user/delete error:', e.message);
+    res.status(500).json({ error: 'Account deletion failed' });
   }
 });
 
