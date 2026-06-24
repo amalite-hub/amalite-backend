@@ -358,6 +358,7 @@ app.post('/auth/google', otpLimiter, async function(req, res) {
 });
 
 // ─── RAZORPAY: CREATE ORDER ───────────────────────────────────────────────────
+// International card payments approved by Razorpay — processes natively in USD.
 app.post('/payment/create-order', requireApiKey, async function(req, res) {
   try {
     var order = await razorpay.orders.create({
