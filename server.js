@@ -3,6 +3,7 @@ const cors = require('cors');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const { Pool } = require('pg');
 const { Resend } = require('resend');
@@ -13,7 +14,7 @@ const cheerio = require('cheerio');
 
 const app = express();
 app.set('trust proxy', 1);
-app.use(cors({ origin: '*', methods: ['GET', 'POST'], allowedHeaders: ['Content-Type'] }));
+app.use(cors({ origin: '*', methods: ['GET', 'POST'], allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key'] }));
 app.use(express.json({ limit: '20mb' }));
 
 // ─── SECURITY: Validate API key on protected routes ──────────
@@ -30,17 +31,40 @@ function requireApiKey(req, res, next) {
   next();
 }
 
-// ─── SECURITY: Validate user session ─────────────────────────
+// ─── SECURITY: Issue a signed session token at login ─────────
+// user_id (the DB row's actual id, NOT derived from email) is embedded as a
+// claim inside a token only this server can sign and verify. A client can
+// no longer just assert "I am user X" — they must present a token this
+// server itself issued after real authentication (OTP or Google).
+function issueToken(user) {
+  return jwt.sign(
+    { sub: user.id, google_id: user.google_id, email: user.email },
+    process.env.JWT_SECRET,
+    { expiresIn: '30d' }
+  );
+}
+
+// ─── SECURITY: Verify session token — replaces the old requireUser, which
+// only checked that a CLIENT-SUPPLIED user_id existed in the DB (no proof
+// of ownership at all). This middleware instead cryptographically verifies
+// the token and takes the identity FROM the token, never from req.body.
 async function requireUser(req, res, next) {
-  var userId = req.body.user_id || req.headers['x-user-id'];
-  if (!userId) return res.status(401).json({ error: 'User ID required' });
+  if (!process.env.JWT_SECRET) {
+    console.error('FATAL: JWT_SECRET env var not set — refusing all authenticated requests');
+    return res.status(500).json({ error: 'Server misconfigured' });
+  }
+  var authHeader = req.headers['authorization'] || '';
+  var token = authHeader.replace('Bearer ', '').trim();
+  if (!token) return res.status(401).json({ error: 'Authentication required' });
+
   try {
-    var result = await pool.query('SELECT * FROM users WHERE google_id = $1', [userId]);
+    var decoded = jwt.verify(token, process.env.JWT_SECRET);
+    var result = await pool.query('SELECT * FROM users WHERE id = $1', [decoded.sub]);
     if (result.rows.length === 0) return res.status(401).json({ error: 'User not found' });
-    req.user = result.rows[0];
+    req.user = result.rows[0]; // identity is now server-verified, not client-asserted
     next();
-  } catch(e) {
-    res.status(500).json({ error: 'Auth check failed' });
+  } catch (e) {
+    return res.status(401).json({ error: 'Invalid or expired session' });
   }
 }
 
@@ -136,41 +160,32 @@ const otpVerifyLimiter = rateLimit({
 app.get('/health', function(req, res) {
   res.json({
     status: 'Amalite backend is running',
-    version: '9.0 (ScraperAPI + NUXT payload regex extraction)',
-    model: 'gemini-2.5-flash',
-    hasGeminiKey: !!process.env.GEMINI_API_KEY,
-    hasRazorpay: !!process.env.RAZORPAY_KEY_ID,
-    hasResend: !!process.env.RESEND_API_KEY,
+    version: '10.0',
   });
 });
 
 // ─── GENERATE ─────────────────────────────────────────────────────────────────
-app.post('/generate', requireApiKey, async function(req, res) {
+app.post('/generate', requireApiKey, requireUser, async function(req, res) {
   var system = req.body.system || '';
   var message = req.body.message;
-  var userId = req.body.user_id || '';
+  var user = req.user; // server-verified identity from the JWT — not from req.body
 
   if (!message) return res.status(400).json({ error: 'message required' });
 
   // Input length limit
   if (message.length > 20000) return res.status(400).json({ error: 'Job description too long' });
 
-  // Server-side proposal count enforcement
-  if (userId) {
-    try {
-      var userResult = await pool.query('SELECT * FROM users WHERE google_id = $1', [userId]);
-      if (userResult.rows.length > 0) {
-        var user = userResult.rows[0];
-        var FREE_LIMIT = 100; // 100 free proposals server-side
-        if (!user.is_pro && user.proposal_count >= FREE_LIMIT) {
-          return res.status(403).json({ error: 'Free proposal limit reached. Please upgrade to Pro.' });
-        }
-        // Increment proposal count
-        await pool.query('UPDATE users SET proposal_count = proposal_count + 1 WHERE google_id = $1', [userId]);
-      }
-    } catch(e) {
-      console.error('Proposal count check error:', e.message);
-    }
+  // Server-side proposal count enforcement — no longer bypassable by omitting
+  // a field, since requireUser already rejected the request if identity
+  // couldn't be verified.
+  var FREE_LIMIT = 5; // 5 free proposals server-side — standard limit for all users
+  if (!user.is_pro && user.proposal_count >= FREE_LIMIT) {
+    return res.status(403).json({ error: 'Free proposal limit reached. Please upgrade to Pro.' });
+  }
+  try {
+    await pool.query('UPDATE users SET proposal_count = proposal_count + 1 WHERE id = $1', [user.id]);
+  } catch (e) {
+    console.error('Proposal count increment error:', e.message);
   }
 
   try {
@@ -179,7 +194,7 @@ app.post('/generate', requireApiKey, async function(req, res) {
     res.json({ content: result.response.text() });
   } catch (error) {
     console.error('/generate error:', error.message);
-    res.status(500).json({ error: 'AI generation failed', detail: error.message });
+    res.status(500).json({ error: 'AI generation failed' });
   }
 });
 
@@ -193,7 +208,7 @@ app.post('/auth/send-otp', otpLimiter, async function(req, res) {
   }
 
   // Generate 6-digit code
-  var code = Math.floor(100000 + Math.random() * 900000).toString();
+  var code = crypto.randomInt(100000, 999999).toString();
   var expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
   try {
@@ -231,7 +246,7 @@ app.post('/auth/send-otp', otpLimiter, async function(req, res) {
     res.json({ success: true, message: 'OTP sent to ' + email });
   } catch (error) {
     console.error('/auth/send-otp error:', error.message);
-    res.status(500).json({ error: 'Failed to send OTP', detail: error.message });
+    res.status(500).json({ error: 'Failed to send OTP' });
   }
 });
 
@@ -278,7 +293,7 @@ app.post('/auth/verify-otp', otpVerifyLimiter, async function(req, res) {
     await pool.query(
       `INSERT INTO users (google_id, name, email, proposal_count) VALUES ($1, $2, $3, $4)
        ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name`,
-      [userId, name, email, hasUsedTrialBefore ? 100 : 0]
+      [userId, name, email, hasUsedTrialBefore ? 5 : 0]
     );
 
     // Record this email as having used a trial, so future re-signups (after deletion) can't reset it
@@ -293,6 +308,7 @@ app.post('/auth/verify-otp', otpVerifyLimiter, async function(req, res) {
 
     res.json({
       success: true,
+      token: issueToken(user), // signed session token — client must send this as Authorization: Bearer <token> on every protected request
       user_id: user.google_id,
       name: user.name,
       email: user.email,
@@ -300,7 +316,7 @@ app.post('/auth/verify-otp', otpVerifyLimiter, async function(req, res) {
     });
   } catch (error) {
     console.error('/auth/verify-otp error:', error.message);
-    res.status(500).json({ error: 'Verification failed', detail: error.message });
+    res.status(500).json({ error: 'Verification failed' });
   }
 });
 
@@ -332,7 +348,7 @@ app.post('/auth/google', otpLimiter, async function(req, res) {
     await pool.query(
       `INSERT INTO users (google_id, name, email, photo_url, proposal_count) VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name, photo_url = EXCLUDED.photo_url`,
-      [userId, name, email, photo, hasUsedTrialBefore ? 100 : 0]
+      [userId, name, email, photo, hasUsedTrialBefore ? 5 : 0]
     );
 
     await pool.query(
@@ -345,6 +361,7 @@ app.post('/auth/google', otpLimiter, async function(req, res) {
 
     res.json({
       success: true,
+      token: issueToken(user),
       user_id: user.google_id,
       name: user.name,
       email: user.email,
@@ -359,13 +376,13 @@ app.post('/auth/google', otpLimiter, async function(req, res) {
 
 // ─── RAZORPAY: CREATE ORDER ───────────────────────────────────────────────────
 // International card payments approved by Razorpay — processes natively in USD.
-app.post('/payment/create-order', requireApiKey, async function(req, res) {
+app.post('/payment/create-order', requireUser, async function(req, res) {
   try {
     var order = await razorpay.orders.create({
       amount: 499,
       currency: 'USD',
       receipt: 'amalite_pro_' + Date.now(),
-      notes: { google_id: req.body.google_id || 'guest', plan: 'pro_monthly' },
+      notes: { google_id: req.user.google_id, plan: 'pro_monthly' },
     });
     res.json({
       order_id: order.id,
@@ -374,16 +391,16 @@ app.post('/payment/create-order', requireApiKey, async function(req, res) {
       key_id: process.env.RAZORPAY_KEY_ID,
     });
   } catch (error) {
-    res.status(500).json({ error: 'Could not create payment order', detail: error.message });
+    console.error('/payment/create-order error:', error.message); res.status(500).json({ error: 'Could not create payment order' });
   }
 });
 
 // ─── RAZORPAY: VERIFY PAYMENT ────────────────────────────────────────────────
-app.post('/payment/verify', async function(req, res) {
+app.post('/payment/verify', requireUser, async function(req, res) {
   var order_id = req.body.order_id;
   var payment_id = req.body.payment_id;
   var signature = req.body.signature;
-  var user_id = req.body.user_id || '';
+  var user = req.user; // server-verified identity — Pro can only ever be granted to whoever authenticated this request
 
   try {
     var body = order_id + '|' + payment_id;
@@ -393,15 +410,8 @@ app.post('/payment/verify', async function(req, res) {
       .digest('hex');
 
     if (expectedSignature === signature) {
-      if (user_id) {
-        // Verify user exists in DB before granting Pro
-        var userCheck = await pool.query('SELECT id FROM users WHERE google_id = $1', [user_id]);
-        if (userCheck.rows.length === 0) {
-          return res.status(400).json({ success: false, error: 'Invalid user' });
-        }
-        await pool.query('UPDATE users SET is_pro = TRUE WHERE google_id = $1', [user_id]);
-        console.log('Pro activated for user:', user_id, 'payment:', payment_id);
-      }
+      await pool.query('UPDATE users SET is_pro = TRUE WHERE id = $1', [user.id]);
+      console.log('Pro activated for user id:', user.id, 'payment:', payment_id);
       res.json({ success: true, is_pro: true, payment_id: payment_id });
     } else {
       console.error('Invalid payment signature attempt for order:', order_id);
@@ -593,31 +603,25 @@ app.post('/import-profile', requireApiKey, async function(req, res) {
 
   } catch (error) {
     console.error('/import-profile error:', error.message);
-    res.status(500).json({ error: 'Import failed: ' + error.message });
+    res.status(500).json({ error: 'Import failed. Please try again or fill in your profile manually.' });
   }
 });
 
 
 // ─── GET USER PRO STATUS ──────────────────────────────────────────────────────
-app.post('/user/status', requireApiKey, async function(req, res) {
-  var userId = req.body.user_id;
-  if (!userId) return res.status(400).json({ error: 'user_id required' });
-  try {
-    var result = await pool.query('SELECT is_pro, proposal_count, photo_url FROM users WHERE google_id = $1', [userId]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
-    res.json({ is_pro: result.rows[0].is_pro, proposal_count: result.rows[0].proposal_count, photo: result.rows[0].photo_url || '' });
-  } catch(e) {
-    res.status(500).json({ error: 'Status check failed' });
-  }
+app.post('/user/status', requireUser, async function(req, res) {
+  // req.user is already the full row, fetched by requireUser via the verified token
+  res.json({
+    is_pro: req.user.is_pro,
+    proposal_count: req.user.proposal_count,
+    photo: req.user.photo_url || '',
+  });
 });
 
 // ─── DELETE USER ACCOUNT ──────────────────────────────────────────────────────
-app.post('/user/delete', requireApiKey, async function(req, res) {
-  var userId = req.body.user_id;
-  if (!userId) return res.status(400).json({ error: 'user_id required' });
+app.post('/user/delete', requireUser, async function(req, res) {
   try {
-    var result = await pool.query('DELETE FROM users WHERE google_id = $1 RETURNING email', [userId]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    await pool.query('DELETE FROM users WHERE id = $1', [req.user.id]);
     // Note: row in used_emails is intentionally NOT removed — it permanently
     // blocks this email from getting a second free trial after re-signup.
     res.json({ success: true });
@@ -629,5 +633,5 @@ app.post('/user/delete', requireApiKey, async function(req, res) {
 
 var PORT = process.env.PORT || 3000;
 app.listen(PORT, function() {
-  console.log('Amalite backend v9.0 running on port ' + PORT);
+  console.log('Amalite backend v10.0 running on port ' + PORT);
 });
