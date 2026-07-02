@@ -443,17 +443,23 @@ app.post('/import-profile', requireApiKey, async function(req, res) {
     }
 
     // render=true loads JavaScript so skills/portfolio sections actually appear in the HTML
+    // premium=true improves success rate against Upwork's bot detection
     var scraperUrl = 'https://api.scraperapi.com/?api_key=' + scraperKey
       + '&url=' + encodeURIComponent(url)
       + '&render=true'
+      + '&premium=true'
       + '&country_code=us'
-      + '&wait_for_selector=' + encodeURIComponent('[data-qa="freelancer-info"], .up-profile-header, body');
+      + '&device_type=desktop';
 
     var response = null;
     var lastStatus = 0;
-    for (var attempt = 1; attempt <= 2; attempt++) {
+    for (var attempt = 1; attempt <= 3; attempt++) {
       try {
-        response = await fetch(scraperUrl, { method: 'GET' });
+        // 60s timeout per attempt — ScraperAPI render=true can be slow
+        var controller = new AbortController();
+        var timeoutId = setTimeout(function() { controller.abort(); }, 60000);
+        response = await fetch(scraperUrl, { method: 'GET', signal: controller.signal });
+        clearTimeout(timeoutId);
         lastStatus = response.status;
         if (response.ok) break;
         console.log('ScraperAPI attempt', attempt, 'failed with status', lastStatus);
@@ -461,8 +467,8 @@ app.post('/import-profile', requireApiKey, async function(req, res) {
         console.log('ScraperAPI attempt', attempt, 'threw:', fetchErr.message);
         lastStatus = 0;
       }
-      if (attempt < 2) {
-        await new Promise(function(r) { setTimeout(r, 1500); });
+      if (attempt < 3) {
+        await new Promise(function(r) { setTimeout(r, 2000); });
       }
     }
 
