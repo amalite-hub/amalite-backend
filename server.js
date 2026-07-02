@@ -321,18 +321,21 @@ app.post('/auth/verify-otp', otpVerifyLimiter, async function(req, res) {
 });
 
 // ─── AUTH: GOOGLE SIGN-IN ──────────────────────────────────────────────────────
-app.post('/auth/google', otpLimiter, async function(req, res) {
+app.post('/auth/google', async function(req, res) {
   var idToken = req.body.id_token;
   if (!idToken) return res.status(400).json({ error: 'id_token required' });
 
   try {
     // Server-side verification of the ID token — this is the step that actually
-    // proves the token is real and was issued by Google for OUR app, not
-    // something a client could fake by just sending arbitrary name/email fields.
-    var ticket = await googleClient.verifyIdToken({
+    // Verify Google token with a 10s timeout to prevent indefinite hangs
+    var verifyPromise = googleClient.verifyIdToken({
       idToken: idToken,
       audience: process.env.GOOGLE_WEB_CLIENT_ID,
     });
+    var timeoutPromise = new Promise(function(_, reject) {
+      setTimeout(function() { reject(new Error('Google token verification timed out')); }, 10000);
+    });
+    var ticket = await Promise.race([verifyPromise, timeoutPromise]);
     var payload = ticket.getPayload();
     var email = (payload.email || '').trim().toLowerCase();
     var name = payload.name || 'User';
