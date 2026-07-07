@@ -156,6 +156,58 @@ const otpVerifyLimiter = rateLimit({
   message: { error: 'Too many attempts. Please request a new code and wait 10 minutes.' },
 });
 
+
+// ─── PARSE PROFILE WITH GEMINI ───────────────────────────────────────────────
+// Receives raw Upwork NUXT profile data, sends to Gemini, returns structured JSON
+app.post('/parse-profile', requireApiKey, async function(req, res) {
+  var rawData = req.body.rawData;
+  if (!rawData) return res.status(400).json({ error: 'rawData required' });
+
+  try {
+    var genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    var model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+
+    var prompt = `Extract structured freelancer profile data from this Upwork profile JSON.
+
+Return ONLY valid JSON in this EXACT structure (no markdown, no backticks, no explanation):
+{
+  "name": "full name or empty string",
+  "title": "professional title or empty string",
+  "bio": "professional bio/description or empty string",
+  "skills": ["skill1", "skill2"],
+  "rate": "hourly rate as number string e.g. 35 or empty string",
+  "location": "city or country or empty string",
+  "jobSuccess": "job success score e.g. 91% or empty string",
+  "totalJobs": "total completed jobs number or empty string",
+  "totalHours": "total hours number or empty string",
+  "yearsExperience": "estimated years from work history dates or empty string",
+  "employmentHistory": [{"title": "job title", "company": "company", "duration": "dates"}],
+  "completedProjects": [{"title": "project title", "description": "brief description", "result": "outcome"}]
+}
+
+Rules:
+- Extract ONLY what is explicitly present in the data. Never invent values.
+- For yearsExperience: calculate from earliest employment date to now. Empty string if not determinable.
+- Keep completedProjects to max 5 most relevant.
+- Skills array max 15 items.
+
+Data:
+${rawData.substring(0, 15000)}`;
+
+    var result = await model.generateContent(prompt);
+    var text = result.response.text().trim();
+    text = text.replace(/```json
+?/g, '').replace(/```
+?/g, '').trim();
+    var parsed = JSON.parse(text);
+    console.log('/parse-profile success for:', parsed.name || 'unknown');
+    return res.json({ success: true, profile: parsed });
+  } catch (error) {
+    console.error('/parse-profile error:', error.message);
+    return res.status(500).json({ error: 'Could not parse profile. Please fill in manually.' });
+  }
+});
+
 // ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
 app.get('/health', function(req, res) {
   res.json({
@@ -327,15 +379,12 @@ app.post('/auth/google', async function(req, res) {
 
   try {
     // Server-side verification of the ID token — this is the step that actually
-    // Verify Google token with a 10s timeout to prevent indefinite hangs
-    var verifyPromise = googleClient.verifyIdToken({
+    // proves the token is real and was issued by Google for OUR app, not
+    // something a client could fake by just sending arbitrary name/email fields.
+    var ticket = await googleClient.verifyIdToken({
       idToken: idToken,
       audience: process.env.GOOGLE_WEB_CLIENT_ID,
     });
-    var timeoutPromise = new Promise(function(_, reject) {
-      setTimeout(function() { reject(new Error('Google token verification timed out')); }, 10000);
-    });
-    var ticket = await Promise.race([verifyPromise, timeoutPromise]);
     var payload = ticket.getPayload();
     var email = (payload.email || '').trim().toLowerCase();
     var name = payload.name || 'User';
@@ -443,23 +492,17 @@ app.post('/import-profile', requireApiKey, async function(req, res) {
     }
 
     // render=true loads JavaScript so skills/portfolio sections actually appear in the HTML
-    // premium=true improves success rate against Upwork's bot detection
     var scraperUrl = 'https://api.scraperapi.com/?api_key=' + scraperKey
       + '&url=' + encodeURIComponent(url)
       + '&render=true'
-      + '&premium=true'
       + '&country_code=us'
-      + '&device_type=desktop';
+      + '&wait_for_selector=' + encodeURIComponent('[data-qa="freelancer-info"], .up-profile-header, body');
 
     var response = null;
     var lastStatus = 0;
-    for (var attempt = 1; attempt <= 3; attempt++) {
+    for (var attempt = 1; attempt <= 2; attempt++) {
       try {
-        // 60s timeout per attempt — ScraperAPI render=true can be slow
-        var controller = new AbortController();
-        var timeoutId = setTimeout(function() { controller.abort(); }, 60000);
-        response = await fetch(scraperUrl, { method: 'GET', signal: controller.signal });
-        clearTimeout(timeoutId);
+        response = await fetch(scraperUrl, { method: 'GET' });
         lastStatus = response.status;
         if (response.ok) break;
         console.log('ScraperAPI attempt', attempt, 'failed with status', lastStatus);
@@ -467,8 +510,8 @@ app.post('/import-profile', requireApiKey, async function(req, res) {
         console.log('ScraperAPI attempt', attempt, 'threw:', fetchErr.message);
         lastStatus = 0;
       }
-      if (attempt < 3) {
-        await new Promise(function(r) { setTimeout(r, 2000); });
+      if (attempt < 2) {
+        await new Promise(function(r) { setTimeout(r, 1500); });
       }
     }
 
