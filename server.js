@@ -164,9 +164,6 @@ app.post('/parse-profile', requireApiKey, async function(req, res) {
   if (!rawData) return res.status(400).json({ error: 'rawData required' });
 
   try {
-    var genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-    var model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
-
     var prompt = `Extract structured freelancer profile data from this Upwork profile JSON.
 
 Return ONLY valid JSON in this EXACT structure (no markdown, no backticks, no explanation):
