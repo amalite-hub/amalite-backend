@@ -193,9 +193,7 @@ ${rawData.substring(0, 15000)}`;
 
     var result = await model.generateContent(prompt);
     var text = result.response.text().trim();
-    text = text.replace(/```json
-?/g, '').replace(/```
-?/g, '').trim();
+    text = text.replace(/```json/g, '').replace(/```/g, '').trim();
     var parsed = JSON.parse(text);
     console.log('/parse-profile success for:', parsed.name || 'unknown');
     return res.json({ success: true, profile: parsed });
