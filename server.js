@@ -70,13 +70,28 @@ async function requireUser(req, res, next) {
 
 // Initialize Gemini
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+// Fallback chain — if primary model is congested, tries the next one automatically
+var MODEL_CHAIN = ['gemini-3.5-flash', 'gemini-2.5-flash-lite', 'gemini-3.1-flash-lite'];
+var GEN_CONFIG = { temperature: 0.5, topP: 0.9, maxOutputTokens: 8192 };
+
+async function generateWithFallback(prompt) {
+  for (var i = 0; i < MODEL_CHAIN.length; i++) {
+    try {
+      var m = genAI.getGenerativeModel({ model: MODEL_CHAIN[i], generationConfig: GEN_CONFIG });
+      var result = await m.generateContent(prompt);
+      if (i > 0) console.log('Fallback used:', MODEL_CHAIN[i]);
+      return result;
+    } catch (err) {
+      console.log('Model', MODEL_CHAIN[i], 'error:', err.message.substring(0, 100));
+      if (i === MODEL_CHAIN.length - 1) throw err;
+    }
+  }
+}
+
 const model = genAI.getGenerativeModel({
   model: 'gemini-3.5-flash',
-  generationConfig: {
-    temperature: 0.5,
-    topP: 0.9,
-    maxOutputTokens: 8192,
-  },
+  generationConfig: GEN_CONFIG,
 });
 // Initialize Razorpay
 const razorpay = new Razorpay({
@@ -191,7 +206,7 @@ Rules:
 Data:
 ${rawData.substring(0, 15000)}`;
 
-    var result = await model.generateContent(prompt);
+    var result = await generateWithFallback(prompt);
     var text = result.response.text().trim();
     text = text.replace(/```json/g, '').replace(/```/g, '').trim();
     var parsed = JSON.parse(text);
@@ -237,7 +252,7 @@ app.post('/generate', requireApiKey, requireUser, async function(req, res) {
 
   try {
     const fullPrompt = system + '\n\n' + message;
-    const result = await model.generateContent(fullPrompt);
+    const result = await generateWithFallback(fullPrompt);
     res.json({ content: result.response.text() });
   } catch (error) {
     console.error('/generate error:', error.message);
