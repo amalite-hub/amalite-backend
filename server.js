@@ -134,7 +134,10 @@ pool.query(`
 `).then(function() {
   console.log('Users table ready');
   // Add photo_url column if upgrading from an older schema that didn't have it
-  return pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_url TEXT`);
+  return pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_url TEXT`)
+  .then(function() {
+    return pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_data TEXT`);
+  });
 }).catch(function(err) { console.error('Users table create error:', err.message); });
 
 // Tracks emails that have already used a free trial, even after the user
@@ -215,6 +218,36 @@ ${rawData.substring(0, 15000)}`;
   } catch (error) {
     console.error('/parse-profile error:', error.message);
     return res.status(500).json({ error: 'Could not parse profile. Please fill in manually.' });
+  }
+});
+
+
+// ─── FREELANCER PROFILE SYNC ─────────────────────────────────────────────────
+app.post('/profile/save', requireUser, async function(req, res) {
+  var profileData = req.body.profileData;
+  if (!profileData) return res.status(400).json({ error: 'profileData required' });
+  try {
+    await pool.query(
+      'UPDATE users SET profile_data = $1 WHERE id = $2',
+      [JSON.stringify(profileData), req.user.id]
+    );
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('/profile/save error:', err.message);
+    return res.status(500).json({ error: 'Could not save profile' });
+  }
+});
+
+app.get('/profile/load', requireUser, async function(req, res) {
+  try {
+    var result = await pool.query('SELECT profile_data FROM users WHERE id = $1', [req.user.id]);
+    if (!result.rows.length || !result.rows[0].profile_data) {
+      return res.json({ success: true, profile: null });
+    }
+    return res.json({ success: true, profile: JSON.parse(result.rows[0].profile_data) });
+  } catch (err) {
+    console.error('/profile/load error:', err.message);
+    return res.status(500).json({ error: 'Could not load profile' });
   }
 });
 
