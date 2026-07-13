@@ -393,7 +393,10 @@ app.post('/auth/google', async function(req, res) {
     // something a client could fake by just sending arbitrary name/email fields.
     var ticket = await googleClient.verifyIdToken({
       idToken: idToken,
-      audience: process.env.GOOGLE_WEB_CLIENT_ID,
+      audience: [
+        process.env.GOOGLE_WEB_CLIENT_ID,
+        process.env.GOOGLE_ANDROID_CLIENT_ID
+      ],
     });
     var payload = ticket.getPayload();
     var email = (payload.email || '').trim().toLowerCase();
